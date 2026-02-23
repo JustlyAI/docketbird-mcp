@@ -43,7 +43,7 @@ jobs:
             docker run -d \
               --name docketbird-mcp \
               --restart=always \
-              -e SERVER_URL="https://docketbird-mcp.com" \
+              -e SERVER_URL="https://app.docketbird-mcp.com" \
               -v docketbird-data:/app/data \
               -p 127.0.0.1:8040:8080 \
               --health-cmd="python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\"" \

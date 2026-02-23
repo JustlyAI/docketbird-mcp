@@ -56,8 +56,8 @@ See [installation.pdf](installation.pdf) for the full walkthrough with screensho
 
 ### Quick version
 
-1. Register at [https://docketbird-mcp.com/signup](https://docketbird-mcp.com/signup) with your email, password, and DocketBird API key
-2. In Claude.ai or Claude Desktop, add a remote MCP server with URL `https://docketbird-mcp.com/mcp`
+1. Register at [https://app.docketbird-mcp.com/signup](https://app.docketbird-mcp.com/signup) with your email, password, and DocketBird API key
+2. In Claude.ai or Claude Desktop, add a remote MCP server with URL `https://app.docketbird-mcp.com/mcp`
 3. Claude auto-discovers OAuth, redirects you to log in, and connects
 
 ### Stdio (local development)
@@ -110,9 +110,9 @@ In stdio mode, the `DOCKETBIRD_API_KEY` env var is used directly (no OAuth).
 
 Deployed via Docker and GitHub Actions. Pushes to `main` trigger automatic deployment.
 
-- Domain: `docketbird-mcp.com`
+- Domain: `app.docketbird-mcp.com`
 - Docker volume: `docketbird-data` at `/app/data` (SQLite auth database)
-- Health check: `https://docketbird-mcp.com/health`
+- Health check: `https://app.docketbird-mcp.com/health`
 - Caddy reverse proxy handles HTTPS (Let's Encrypt)
 
 ### Local Docker Build
