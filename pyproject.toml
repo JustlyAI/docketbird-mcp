@@ -1,0 +1,18 @@
+[project]
+name = "docketbird-mcp"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "mcp==1.18.0",
+    "httpx==0.28.1",
+    "uvicorn[standard]==0.34.0",
+    "pydantic==2.11.7",
+    "termcolor==2.5.0",
+    "starlette==0.48.0",
+    "aiosqlite==0.20.0",
+    "bcrypt==4.2.1",
+]
+
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
