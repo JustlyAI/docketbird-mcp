@@ -136,4 +136,4 @@ docker run -d \
 
 ## Acknowledgment
 
-This project is built upon the original [docketbird-mcp](https://github.com/gravix-db/docketbird-mcp) developed in conjunction with @federicoburman and the Gravix.ai team.
+This project is built upon the original [docketbird-mcp](https://github.com/gravix-db/docketbird-mcp) developed in conjunction with @federicoburman and the Gravix.AI team.
