@@ -206,6 +206,16 @@ class AuthDB:
         )
         return await cursor.fetchone() is not None
 
+    async def update_password(self, user_id: int, new_password: str) -> None:
+        """Update a user's password hash."""
+        hashed = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        await self._db.execute(
+            "UPDATE users SET password_hash = ? WHERE id = ?",
+            (hashed, user_id),
+        )
+        await self._db.commit()
+        cprint(f"[AUTH] Password updated for user_id={user_id}", "green")
+
     # ---- OAuth Clients (Dynamic Client Registration) ----
 
     async def save_client(self, client_info: OAuthClientInformationFull) -> None:
@@ -692,6 +702,68 @@ def _login_html(auth_session: str = "", error: str = "") -> str:
             <button type="submit">Log In</button>
         </form>
         <p class="signup-link">No account? <a href="/signup">Sign up</a></p>
+        <p class="signup-link"><a href="/change-password">Forgot your password?</a></p>
+    </div>
+</body>
+</html>"""
+
+
+def _change_password_html(message: str = "") -> str:
+    """Generate change password page HTML."""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DocketBird MCP - Change Password</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+               background: #f5f5f5; display: flex; justify-content: center; align-items: center;
+               min-height: 100vh; padding: 20px; }}
+        .card {{ background: white; border-radius: 12px; padding: 40px; max-width: 420px;
+                width: 100%; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
+        h1 {{ font-size: 24px; margin-bottom: 8px; color: #1a1a1a; }}
+        p.subtitle {{ color: #666; margin-bottom: 24px; font-size: 14px; }}
+        label {{ display: block; font-size: 14px; font-weight: 500; margin-bottom: 4px; color: #333; }}
+        input {{ width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px;
+                font-size: 14px; margin-bottom: 16px; }}
+        input:focus {{ outline: none; border-color: #4a90d9; box-shadow: 0 0 0 2px rgba(74,144,217,0.2); }}
+        button {{ width: 100%; padding: 12px; background: #1a73e8; color: white; border: none;
+                 border-radius: 8px; font-size: 16px; font-weight: 500; cursor: pointer; }}
+        button:hover {{ background: #1557b0; }}
+        .error {{ background: #fef2f2; color: #dc2626; padding: 10px; border-radius: 8px;
+                 margin-bottom: 16px; font-size: 14px; }}
+        .success {{ background: #f0fdf4; color: #16a34a; padding: 10px; border-radius: 8px;
+                   margin-bottom: 16px; font-size: 14px; }}
+        .login-link {{ text-align: center; margin-top: 16px; font-size: 14px; color: #666; }}
+        .login-link a {{ color: #1a73e8; text-decoration: none; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Change Password</h1>
+        <p class="subtitle">Enter your current credentials and choose a new password.</p>
+        {message}
+        <form method="POST" action="/change-password">
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" required placeholder="Your registered email">
+
+            <label for="current_password">Current Password</label>
+            <input type="password" id="current_password" name="current_password" required
+                   placeholder="Your current MCP server password">
+
+            <label for="new_password">New Password</label>
+            <input type="password" id="new_password" name="new_password" required minlength="8"
+                   placeholder="Min 8 characters">
+
+            <label for="confirm_password">Confirm New Password</label>
+            <input type="password" id="confirm_password" name="confirm_password" required minlength="8"
+                   placeholder="Re-enter new password">
+
+            <button type="submit">Change Password</button>
+        </form>
+        <p class="login-link"><a href="/login">Back to login</a></p>
     </div>
 </body>
 </html>"""
@@ -821,3 +893,62 @@ async def handle_login(request: Request, db: AuthDB) -> HTMLResponse | RedirectR
     redirect_url = f"{params.redirect_uri}?{urlencode(redirect_params)}"
     cprint(f"[AUTH] Login success for {email}, redirecting to OAuth client", "green")
     return RedirectResponse(url=redirect_url, status_code=302)
+
+
+async def handle_change_password(request: Request, db: AuthDB) -> HTMLResponse:
+    """Handle GET /change-password (show form) and POST /change-password (update password)."""
+    if request.method == "GET":
+        return HTMLResponse(_change_password_html(), headers=SECURITY_HEADERS)
+
+    # POST: process form
+    form = await request.form()
+    email = str(form.get("email", "")).strip()
+    current_password = str(form.get("current_password", ""))
+    new_password = str(form.get("new_password", ""))
+    confirm_password = str(form.get("confirm_password", ""))
+
+    if not email or not current_password or not new_password or not confirm_password:
+        return HTMLResponse(
+            _change_password_html('<div class="error">All fields are required.</div>'),
+            status_code=400,
+            headers=SECURITY_HEADERS,
+        )
+
+    if len(new_password) < 8:
+        return HTMLResponse(
+            _change_password_html('<div class="error">New password must be at least 8 characters.</div>'),
+            status_code=400,
+            headers=SECURITY_HEADERS,
+        )
+
+    if new_password != confirm_password:
+        return HTMLResponse(
+            _change_password_html('<div class="error">New passwords do not match.</div>'),
+            status_code=400,
+            headers=SECURITY_HEADERS,
+        )
+
+    # Authenticate with current credentials
+    user = await db.authenticate_user(email, current_password)
+    if not user:
+        return HTMLResponse(
+            _change_password_html('<div class="error">Invalid email or current password.</div>'),
+            status_code=401,
+            headers=SECURITY_HEADERS,
+        )
+
+    # Update password
+    try:
+        await db.update_password(user["id"], new_password)
+        cprint(f"[AUTH] Password changed for {email}", "green")
+        return HTMLResponse(
+            _change_password_html('<div class="success">Password changed successfully. You can now log in with your new password.</div>'),
+            headers=SECURITY_HEADERS,
+        )
+    except Exception as e:
+        cprint(f"[AUTH] Change password error: {e}", "red")
+        return HTMLResponse(
+            _change_password_html('<div class="error">Something went wrong. Please try again.</div>'),
+            status_code=500,
+            headers=SECURITY_HEADERS,
+        )

@@ -32,6 +32,7 @@ from auth_provider import (
     AuthDB,
     DocketBirdAccessToken,
     DocketBirdAuthProvider,
+    handle_change_password,
     handle_login,
     handle_signup,
 )
@@ -770,6 +771,13 @@ async def app(scope, receive, send):
     if path == "/login":
         request = Request(scope, receive)
         response = await handle_login(request, auth_db)
+        await response(scope, receive, send)
+        return
+
+    # Change password page (no OAuth auth required)
+    if path == "/change-password":
+        request = Request(scope, receive)
+        response = await handle_change_password(request, auth_db)
         await response(scope, receive, send)
         return
 
