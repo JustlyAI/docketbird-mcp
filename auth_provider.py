@@ -41,7 +41,7 @@ from termcolor import cprint
 SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'",
     "Referrer-Policy": "strict-origin-when-cross-origin",
 }
 
@@ -699,8 +699,15 @@ def _login_html(auth_session: str = "", error: str = "") -> str:
             <input type="password" id="password" name="password" required
                    placeholder="The password you created during signup">
 
-            <button type="submit">Log In</button>
+            <button type="submit" id="login-btn">Log In</button>
         </form>
+        <script>
+        document.querySelector('form').addEventListener('submit', function() {{
+            var btn = document.getElementById('login-btn');
+            btn.disabled = true;
+            btn.textContent = 'Logging in...';
+        }});
+        </script>
         <p class="signup-link">No account? <a href="/signup">Sign up</a></p>
         <p class="signup-link"><a href="/change-password">Forgot your password?</a></p>
     </div>
@@ -843,9 +850,9 @@ async def handle_login(request: Request, db: AuthDB) -> HTMLResponse | RedirectR
     # Load the pending auth session
     pending = await db.get_pending_auth(auth_session)
     if not pending:
+        # Session was already consumed (double-submit) or expired
         return HTMLResponse(
-            _login_html(error="Auth session expired or invalid. Please try connecting from Claude again."),
-            status_code=400,
+            _login_html(error="Login was already completed. Please return to Claude to continue. If it didn't work, try reconnecting from Claude."),
             headers=SECURITY_HEADERS,
         )
 
