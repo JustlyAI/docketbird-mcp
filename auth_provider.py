@@ -41,7 +41,7 @@ from termcolor import cprint
 SECURITY_HEADERS = {
     "X-Frame-Options": "DENY",
     "X-Content-Type-Options": "nosniff",
-    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self'",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; form-action 'self' https://claude.ai https://*.claude.ai",
     "Referrer-Policy": "strict-origin-when-cross-origin",
 }
 
