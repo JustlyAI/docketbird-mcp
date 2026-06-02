@@ -32,6 +32,7 @@ from auth_provider import (
     AuthDB,
     DocketBirdAccessToken,
     DocketBirdAuthProvider,
+    handle_change_api_key,
     handle_change_password,
     handle_login,
     handle_signup,
@@ -165,6 +166,46 @@ async def make_request(
     return response.json()
 
 
+async def make_post_request(
+    endpoint: str,
+    body: dict[str, Any],
+    api_key: str = "",
+) -> dict[str, Any]:
+    """Make an authenticated POST request to DocketBird API with per-user API key.
+
+    The write endpoints return a success status with no documented body schema,
+    so we return the parsed JSON when present and fall back to a status dict.
+    """
+    client = get_http_client()
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    cprint(f"[MCP] API POST: {endpoint} body={body}", "cyan")
+    response = await client.post(endpoint, json=body, headers=headers)
+    response.raise_for_status()
+    if response.content:
+        try:
+            return response.json()
+        except ValueError:
+            pass
+    return {"status": "ok"}
+
+
+async def validate_docketbird_api_key(api_key: str) -> bool:
+    """Check a DocketBird API key by making the lightest authenticated call.
+
+    Returns True if the key authenticates, False if DocketBird rejects it (401/403).
+    Raises on network/other errors so the caller can report "couldn't verify" rather
+    than silently saving an unverifiable key. Uses GET /cases?scope=user — the
+    lightest auth-only endpoint (no dedicated account endpoint exists in the API).
+    """
+    try:
+        await make_request("/cases", params={"scope": "user"}, api_key=api_key)
+        return True
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code in (401, 403):
+            return False
+        raise
+
+
 async def cleanup_http_client() -> None:
     """Clean up HTTP client on shutdown."""
     global _http_client
@@ -202,6 +243,24 @@ def get_user_api_key() -> str:
 # =============================================================================
 
 
+def _api_error_message(error: httpx.HTTPStatusError) -> str | None:
+    """Extract DocketBird's own error message from the response body, if present.
+
+    DocketBird returns {"status": "error", "message": "..."} on failures, and the
+    message is often more actionable than our generic text (e.g. a 403 that says
+    "please follow it. Charges may apply.").
+    """
+    try:
+        body = error.response.json()
+    except (ValueError, AttributeError):
+        return None
+    if isinstance(body, dict):
+        msg = body.get("message")
+        if isinstance(msg, str) and msg.strip():
+            return msg.strip()
+    return None
+
+
 def handle_api_error(error: Exception, operation: str) -> str:
     """Format API errors with actionable messages."""
     if isinstance(error, httpx.HTTPStatusError):
@@ -213,7 +272,9 @@ def handle_api_error(error: Exception, operation: str) -> str:
             429: f"Rate limited. Wait 60 seconds before retrying {operation}.",
             504: f"Gateway timeout for {operation}. Try again.",
         }
-        return messages.get(status, f"HTTP {status} error for {operation}.")
+        base = messages.get(status, f"HTTP {status} error for {operation}.")
+        api_msg = _api_error_message(error)
+        return f"{base} DocketBird: {api_msg}" if api_msg else base
     if isinstance(error, httpx.TimeoutException):
         return f"Request timed out for {operation}. Try again."
     if isinstance(error, httpx.ConnectError):
@@ -338,6 +399,13 @@ DOWNLOAD_TOOL = ToolAnnotations(
     openWorldHint=True,
 )
 
+WRITE_TOOL = ToolAnnotations(
+    readOnlyHint=False,  # Mutates state on the DocketBird side
+    destructiveHint=False,
+    idempotentHint=False,  # POST is not idempotent
+    openWorldHint=True,
+)
+
 LOCAL_READ_TOOL = ToolAnnotations(
     readOnlyHint=True,
     destructiveHint=False,
@@ -375,6 +443,18 @@ async def docketbird_get_case_details(case_id: str, page: int = 1, page_size: in
         parties = data.get("data", {}).get("parties", [])
         documents = data.get("data", {}).get("documents", [])
 
+        # Best-effort: the dedicated single-case endpoint adds PACER case ID and
+        # client code that /documents does not return. Never fail the tool on this.
+        pacer_case_id = None
+        client_code = None
+        try:
+            case_data = await make_request(f"/cases/{case_id}", api_key=api_key)
+            case_detail = case_data.get("data", {}).get("case", {})
+            pacer_case_id = case_detail.get("pacer_case_id")
+            client_code = case_detail.get("client_code")
+        except Exception as e:
+            cprint(f"[MCP] Could not fetch single-case detail for {case_id}: {e}", "yellow")
+
         total_docs = len(documents)
         start = (page - 1) * page_size
         end = start + page_size
@@ -387,9 +467,12 @@ async def docketbird_get_case_details(case_id: str, page: int = 1, page_size: in
             f"**Filed**: {case.get('date_filed', 'N/A')}",
             f"**Closed**: {case.get('date_closed') or 'Open'}",
             f"**URL**: {case.get('url', 'N/A')}",
-            "",
-            "## Parties",
         ]
+        if pacer_case_id:
+            lines.append(f"**PACER Case ID**: {pacer_case_id}")
+        if client_code:
+            lines.append(f"**Client Code**: {client_code}")
+        lines.extend(["", "## Parties"])
         for party in parties:
             lines.append(f"- {party.get('name', 'N/A')} ({party.get('type', 'N/A')})")
 
@@ -508,6 +591,8 @@ async def docketbird_list_cases(scope: Literal["company", "user"], page: int = 1
             lines.append(f"\n**{case.get('title', 'N/A')}**")
             lines.append(f"- ID: {case.get('id')}")
             lines.append(f"- Court: {case.get('court_id')}")
+            if case.get("case_number"):
+                lines.append(f"- Case Number: {case.get('case_number')}")
             lines.append(f"- Filed: {case.get('date_filed', 'N/A')}")
 
         if page < total_pages:
@@ -581,6 +666,12 @@ async def docketbird_download_document(document_id: str, save_path: str) -> str:
         data = await make_request(f"/documents/{document_id}", api_key=api_key)
         document = data.get("data", {}).get("document", {})
 
+        if document.get("restricted"):
+            return (
+                f"Document {document_id} is restricted and cannot be downloaded. "
+                "Restricted filings are sealed or access-limited on PACER/DocketBird."
+            )
+
         s3_url = document.get("docketbird_document_url")
         if not s3_url:
             return f"Document {document_id} exists but is not yet available for download"
@@ -592,7 +683,9 @@ async def docketbird_download_document(document_id: str, save_path: str) -> str:
         client = get_http_client()
         cprint(f"[MCP] Downloading from S3: {s3_url[:50]}...", "cyan")
 
-        filename = sanitize_filename(s3_url)
+        # Prefer the API-provided custom filename; fall back to the S3 URL.
+        # Always sanitize (path-safety) regardless of source.
+        filename = sanitize_filename(document.get("custom_filename") or s3_url)
         save_dir.mkdir(parents=True, exist_ok=True)
         full_path = save_dir / filename
 
@@ -642,12 +735,19 @@ async def docketbird_download_files(case_id: str, save_path: str) -> str:
 
         downloaded = []
         skipped = []
+        restricted = []
         failed = []
 
         save_dir.mkdir(parents=True, exist_ok=True)
 
         client = get_http_client()
         for doc in documents:
+            # Restricted filings are sealed/access-limited; skip defensively
+            # (the /documents list may or may not carry this flag).
+            if doc.get("restricted"):
+                restricted.append(doc.get("id"))
+                continue
+
             s3_url = doc.get("docketbird_document_url")
             if not s3_url:
                 skipped.append(doc.get("id"))
@@ -658,7 +758,8 @@ async def docketbird_download_files(case_id: str, save_path: str) -> str:
                 validate_download_url(s3_url)
 
                 cprint(f"[MCP] Downloading: {doc.get('title', 'N/A')[:40]}...", "cyan")
-                filename = sanitize_filename(s3_url)
+                # Prefer API-provided custom filename when present; always sanitize.
+                filename = sanitize_filename(doc.get("custom_filename") or s3_url)
                 full_path = save_dir / filename
 
                 async with client.stream("GET", s3_url) as response:
@@ -690,6 +791,8 @@ async def docketbird_download_files(case_id: str, save_path: str) -> str:
         lines.append(f"**Downloaded**: {len(downloaded)} files to {save_dir}")
         if skipped:
             lines.append(f"**Skipped**: {len(skipped)} documents (not available)")
+        if restricted:
+            lines.append(f"**Restricted**: {len(restricted)} documents (sealed/access-limited)")
         if failed:
             lines.append(f"**Failed**: {len(failed)} documents")
 
@@ -699,6 +802,75 @@ async def docketbird_download_files(case_id: str, save_path: str) -> str:
         return f"Security error: {e}"
     except Exception as e:
         return handle_api_error(e, f"download files for case {case_id}")
+
+
+@mcp.tool(annotations=READ_ONLY_API_TOOL)
+async def docketbird_get_calendar(case_id: str) -> str:
+    """Get calendar entries (deadlines and hearings) for a case.
+
+    When to use:
+    - User wants upcoming deadlines or scheduled hearings for a case
+    - Tracking court dates and filing deadlines
+    - Reviewing a case's docket schedule
+
+    Args:
+        case_id: DocketBird case ID (e.g., 'txnd-3:2007-cv-01697')
+    """
+    try:
+        api_key = get_user_api_key()
+        cprint(f"[MCP] docketbird_get_calendar: {case_id}", "green")
+        data = await make_request("/calendar_entries", params={"case_id": case_id}, api_key=api_key)
+
+        entries = data.get("data", {}).get("calendar_entries", [])
+        if not entries:
+            return f"No calendar entries found for case {case_id}"
+
+        lines = [f"## Calendar Entries for {case_id} ({len(entries)} total)"]
+        for entry in entries:
+            lines.append(f"\n**{entry.get('title', 'N/A')}**")
+            lines.append(f"- When: {entry.get('iso8601_datetime', 'N/A')}")
+            lines.append(f"- ID: {entry.get('id')} (uuid: {entry.get('uuid', 'N/A')})")
+            if entry.get("document_id"):
+                lines.append(f"- Document: {entry.get('document_id')}")
+
+        return "\n".join(lines)
+
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        # The API returns 404 when a case has no calendar; treat as empty, not error.
+        if isinstance(e, httpx.HTTPStatusError) and e.response.status_code == 404:
+            return f"No calendar entries found for case {case_id}"
+        return handle_api_error(e, f"calendar for case {case_id}")
+
+
+@mcp.tool(annotations=WRITE_TOOL)
+async def docketbird_follow_case(case_id: str) -> str:
+    """Follow a court case so DocketBird monitors it for new filings.
+
+    When to use:
+    - User wants to track/monitor a case for new documents
+    - Setting up ongoing monitoring of a docket
+
+    Followed federal cases are checked about twice weekly; state cases about
+    once weekly. New filings trigger DocketBird's new-documents notifications.
+
+    Args:
+        case_id: DocketBird case ID (e.g., 'txnd-3:2007-cv-01697')
+    """
+    try:
+        api_key = get_user_api_key()
+        cprint(f"[MCP] docketbird_follow_case: {case_id}", "green")
+        await make_post_request("/follow_case", body={"case_id": case_id}, api_key=api_key)
+        return (
+            f"Now following case {case_id}. DocketBird will monitor it for new "
+            "filings (federal ~2x/week, state ~1x/week)."
+        )
+
+    except ValueError as e:
+        return str(e)
+    except Exception as e:
+        return handle_api_error(e, f"follow case {case_id}")
 
 
 # =============================================================================
@@ -778,6 +950,13 @@ async def app(scope, receive, send):
     if path == "/change-password":
         request = Request(scope, receive)
         response = await handle_change_password(request, auth_db)
+        await response(scope, receive, send)
+        return
+
+    # Change API key page (no OAuth auth required)
+    if path == "/change-api-key":
+        request = Request(scope, receive)
+        response = await handle_change_api_key(request, auth_db, validate_docketbird_api_key)
         await response(scope, receive, send)
         return
 

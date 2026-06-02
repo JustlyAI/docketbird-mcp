@@ -12,6 +12,8 @@ An MCP server for searching and downloading court documents via the DocketBird A
 | `docketbird_list_courts`       | Get court codes and case types                  |
 | `docketbird_download_document` | Download a single document by ID                |
 | `docketbird_download_files`    | Download all available documents for a case     |
+| `docketbird_get_calendar`      | Get calendar entries (deadlines and hearings)   |
+| `docketbird_follow_case`       | Follow a case so DocketBird monitors new filings |
 
 ## Requirements
 

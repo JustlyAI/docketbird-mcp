@@ -216,6 +216,30 @@ class AuthDB:
         await self._db.commit()
         cprint(f"[AUTH] Password updated for user_id={user_id}", "green")
 
+    async def update_api_key(self, user_id: int, new_api_key: str) -> None:
+        """Update a user's DocketBird API key."""
+        await self._db.execute(
+            "UPDATE users SET docketbird_api_key = ? WHERE id = ?",
+            (new_api_key, user_id),
+        )
+        await self._db.commit()
+        cprint(f"[AUTH] API key updated for user_id={user_id}", "green")
+
+    async def delete_access_tokens_for_user(self, user_id: int) -> int:
+        """Delete all access tokens for a user, returning the number removed.
+
+        Used after an API key change: existing access tokens embed a copy of the
+        old key (see save_access_token), so they must be cleared for the new key to
+        take effect. Refresh tokens are intentionally kept so clients re-sync
+        seamlessly (refresh re-reads the current key in exchange_refresh_token).
+        """
+        cursor = await self._db.execute(
+            "DELETE FROM access_tokens WHERE user_id = ?", (user_id,)
+        )
+        await self._db.commit()
+        cprint(f"[AUTH] Cleared {cursor.rowcount} access tokens for user_id={user_id}", "green")
+        return cursor.rowcount
+
     # ---- OAuth Clients (Dynamic Client Registration) ----
 
     async def save_client(self, client_info: OAuthClientInformationFull) -> None:
@@ -709,7 +733,7 @@ def _login_html(auth_session: str = "", error: str = "") -> str:
         }});
         </script>
         <p class="signup-link">No account? <a href="/signup">Sign up</a></p>
-        <p class="signup-link"><a href="/change-password">Forgot your password?</a></p>
+        <p class="signup-link"><a href="/change-password">Forgot your password?</a> &middot; <a href="/change-api-key">Update your API key?</a></p>
     </div>
 </body>
 </html>"""
@@ -769,6 +793,63 @@ def _change_password_html(message: str = "") -> str:
                    placeholder="Re-enter new password">
 
             <button type="submit">Change Password</button>
+        </form>
+        <p class="login-link"><a href="/login">Back to login</a></p>
+    </div>
+</body>
+</html>"""
+
+
+def _change_api_key_html(message: str = "") -> str:
+    """Generate change API key page HTML."""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>DocketBird MCP - Change API Key</title>
+    <style>
+        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+               background: #f5f5f5; display: flex; justify-content: center; align-items: center;
+               min-height: 100vh; padding: 20px; }}
+        .card {{ background: white; border-radius: 12px; padding: 40px; max-width: 420px;
+                width: 100%; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
+        h1 {{ font-size: 24px; margin-bottom: 8px; color: #1a1a1a; }}
+        p.subtitle {{ color: #666; margin-bottom: 24px; font-size: 14px; }}
+        label {{ display: block; font-size: 14px; font-weight: 500; margin-bottom: 4px; color: #333; }}
+        input {{ width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px;
+                font-size: 14px; margin-bottom: 16px; }}
+        input:focus {{ outline: none; border-color: #4a90d9; box-shadow: 0 0 0 2px rgba(74,144,217,0.2); }}
+        button {{ width: 100%; padding: 12px; background: #1a73e8; color: white; border: none;
+                 border-radius: 8px; font-size: 16px; font-weight: 500; cursor: pointer; }}
+        button:hover {{ background: #1557b0; }}
+        .error {{ background: #fef2f2; color: #dc2626; padding: 10px; border-radius: 8px;
+                 margin-bottom: 16px; font-size: 14px; }}
+        .success {{ background: #f0fdf4; color: #16a34a; padding: 10px; border-radius: 8px;
+                   margin-bottom: 16px; font-size: 14px; }}
+        .login-link {{ text-align: center; margin-top: 16px; font-size: 14px; color: #666; }}
+        .login-link a {{ color: #1a73e8; text-decoration: none; }}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h1>Change API Key</h1>
+        <p class="subtitle">Authenticate, then enter your new DocketBird API key.</p>
+        {message}
+        <form method="POST" action="/change-api-key">
+            <label for="email">Email</label>
+            <input type="email" id="email" name="email" required placeholder="Your registered email">
+
+            <label for="current_password">Current Password</label>
+            <input type="password" id="current_password" name="current_password" required
+                   placeholder="Your current MCP server password">
+
+            <label for="new_api_key">New DocketBird API Key</label>
+            <input type="text" id="new_api_key" name="new_api_key" required
+                   placeholder="Your new DocketBird API key">
+
+            <button type="submit">Change API Key</button>
         </form>
         <p class="login-link"><a href="/login">Back to login</a></p>
     </div>
@@ -956,6 +1037,74 @@ async def handle_change_password(request: Request, db: AuthDB) -> HTMLResponse:
         cprint(f"[AUTH] Change password error: {e}", "red")
         return HTMLResponse(
             _change_password_html('<div class="error">Something went wrong. Please try again.</div>'),
+            status_code=500,
+            headers=SECURITY_HEADERS,
+        )
+
+
+async def handle_change_api_key(request: Request, db: AuthDB, validate_key) -> HTMLResponse:
+    """Handle GET /change-api-key (show form) and POST /change-api-key (update key).
+
+    validate_key is an injected async callable (api_key: str) -> bool that checks the
+    key against DocketBird. It returns True if valid, False if DocketBird rejects it,
+    and raises if DocketBird is unreachable (so we can avoid saving an unverifiable key).
+    Injecting it keeps this module free of httpx/DocketBird coupling.
+    """
+    if request.method == "GET":
+        return HTMLResponse(_change_api_key_html(), headers=SECURITY_HEADERS)
+
+    # POST: process form
+    form = await request.form()
+    email = str(form.get("email", "")).strip()
+    current_password = str(form.get("current_password", ""))
+    new_api_key = str(form.get("new_api_key", "")).strip()
+
+    if not email or not current_password or not new_api_key:
+        return HTMLResponse(
+            _change_api_key_html('<div class="error">All fields are required.</div>'),
+            status_code=400,
+            headers=SECURITY_HEADERS,
+        )
+
+    # Authenticate with current credentials
+    user = await db.authenticate_user(email, current_password)
+    if not user:
+        return HTMLResponse(
+            _change_api_key_html('<div class="error">Invalid email or current password.</div>'),
+            status_code=401,
+            headers=SECURITY_HEADERS,
+        )
+
+    # Validate the new key against DocketBird before saving
+    try:
+        is_valid = await validate_key(new_api_key)
+    except Exception as e:
+        cprint(f"[AUTH] Could not verify API key against DocketBird: {e}", "red")
+        return HTMLResponse(
+            _change_api_key_html('<div class="error">Couldn\'t reach DocketBird to verify the key. Try again shortly.</div>'),
+            status_code=502,
+            headers=SECURITY_HEADERS,
+        )
+    if not is_valid:
+        return HTMLResponse(
+            _change_api_key_html('<div class="error">That API key was rejected by DocketBird. Check it and try again.</div>'),
+            status_code=400,
+            headers=SECURITY_HEADERS,
+        )
+
+    # Update the key and clear stale access tokens (they embed the old key)
+    try:
+        await db.update_api_key(user["id"], new_api_key)
+        await db.delete_access_tokens_for_user(user["id"])
+        cprint(f"[AUTH] API key changed for {email}", "green")
+        return HTMLResponse(
+            _change_api_key_html('<div class="success">API key updated. Claude will start using the new key automatically.</div>'),
+            headers=SECURITY_HEADERS,
+        )
+    except Exception as e:
+        cprint(f"[AUTH] Change API key error: {e}", "red")
+        return HTMLResponse(
+            _change_api_key_html('<div class="error">Something went wrong. Please try again.</div>'),
             status_code=500,
             headers=SECURITY_HEADERS,
         )
