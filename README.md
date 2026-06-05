@@ -9,7 +9,7 @@ An MCP server for searching and downloading court documents via the DocketBird A
 | `docketbird_get_case_details`  | Get case info, parties, and paginated documents |
 | `docketbird_search_documents`  | Search documents within a case by keyword       |
 | `docketbird_list_cases`        | List cases for company or user scope            |
-| `docketbird_list_courts`       | Get court codes and case types                  |
+| `docketbird_list_courts`       | Get court codes and case types (optional `search` filter) |
 | `docketbird_download_document` | Download a single document by ID                |
 | `docketbird_download_files`    | Download all available documents for a case     |
 | `docketbird_get_calendar`      | Get calendar entries (deadlines and hearings)   |
@@ -51,6 +51,20 @@ DOCKETBIRD_API_KEY="your-key" python docketbird_mcp.py --transport stdio
 python docketbird_mcp.py --transport http
 # Then visit http://localhost:8080/signup to create an account
 ```
+
+> **Note:** All diagnostic logging goes to **stderr**, never stdout. This keeps
+> the stdio JSON-RPC stream clean — writing logs to stdout would corrupt it and
+> break the client.
+
+## Environment Variables
+
+| Variable             | Mode  | Default                 | Description                                                                 |
+| -------------------- | ----- | ----------------------- | --------------------------------------------------------------------------- |
+| `DOCKETBIRD_API_KEY` | stdio | _(none)_                | API key used for all requests in stdio mode (no OAuth). Required for stdio.  |
+| `SERVER_URL`         | http  | `http://localhost:8080` | Public base URL. Used as the OAuth issuer/resource URL and for redirects. Must match the URL clients connect to. |
+| `DATA_DIR`           | http  | `./data`                | Directory holding the SQLite auth database. Mounted as a volume in Docker.   |
+
+See [`.env.example`](.env.example) for a template.
 
 ## Connecting to the Deployed Server
 
@@ -107,6 +121,44 @@ In stdio mode, the `DOCKETBIRD_API_KEY` env var is used directly (no OAuth).
 - Container runs as non-root `mcpuser`
 - GitHub Actions pinned to commit SHAs
 - Dependencies pinned to exact versions
+- Expired tokens, auth codes, and pending sessions are purged hourly (in both stdio and HTTP modes)
+
+> **Where downloads land:** `docketbird_download_document` and
+> `docketbird_download_files` write to the **machine running the server**, at the
+> `save_path` you provide. In stdio (local) mode that's your own machine. On a
+> remote HTTP deployment that's the server's container filesystem, not your
+> computer — so prefer reading/searching documents remotely and run downloads
+> via the local stdio setup when you need the files on disk.
+
+## Development & Testing
+
+Install the dev extras and run the test suite:
+
+```bash
+uv pip install -e ".[dev]"   # or: pip install -e ".[dev]"
+pytest
+```
+
+The suite (`tests/`) runs fully offline — network calls are faked — and covers
+the security helpers (path/URL validation, filename sanitization), pagination
+math, the rate limiter, error formatting, and the streaming download size cap.
+
+For a deeper look at how the server is wired together (OAuth flow, request
+lifecycle, database schema, security model), see
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+## Troubleshooting
+
+- **stdio client shows JSON parse errors:** ensure nothing in your environment
+  writes to stdout. This server logs to stderr by design; custom forks should
+  keep it that way.
+- **`No DocketBird API key available`:** in stdio mode set `DOCKETBIRD_API_KEY`;
+  in HTTP mode complete the OAuth login at `/signup` → connect from Claude.
+- **OAuth login loops or "Invalid redirect URI":** confirm `SERVER_URL` exactly
+  matches the public URL clients use (scheme + host, no trailing slash).
+- **Changed your DocketBird API key but tools still fail:** use `/change-api-key`.
+  It validates the new key against DocketBird and clears stale access tokens so
+  the new key takes effect immediately.
 
 ## Deployment
 
