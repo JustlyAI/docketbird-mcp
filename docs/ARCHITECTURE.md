@@ -94,14 +94,41 @@ Expiring rows are removed lazily on read and proactively by the hourly
 ## HTTP client & downloads
 
 A single pooled `httpx.AsyncClient` (`get_http_client`) is reused for all
-DocketBird API calls and S3 downloads. Downloads stream to disk in 8 KB chunks
-through `_stream_to_file`, which:
+DocketBird API calls and S3 downloads. A shared `_iter_capped_chunks(s3_url,
+max_bytes)` generator is the one place the download invariants live: it validates
+the URL against the SSRF allowlist (`*.s3.amazonaws.com`, `api.docketbird.com`),
+requires HTTPS, bails early if S3's advertised `Content-Length` already exceeds
+the cap, and raises `DownloadTooLarge` the moment the running total would. Two
+sibling streamers consume it with **different caps**:
 
-- validates the URL against the SSRF allowlist (`*.s3.amazonaws.com`,
-  `api.docketbird.com`) and requires HTTPS,
-- enforces a hard `MAX_DOWNLOAD_SIZE` (50 MB), deleting any partial file and
-  raising `DownloadTooLarge` if exceeded,
-- sanitizes the destination filename (no traversal, no hidden files).
+- `_stream_to_file` writes to disk under `MAX_DOWNLOAD_SIZE` (50 MB), deleting any
+  partial file on overflow, and sanitizes the destination filename (no traversal,
+  no hidden files). Used for local stdio saves.
+- `_stream_to_memory` accumulates the bytes in memory under the smaller
+  `MAX_INLINE_SIZE` (10 MB) so the content can be base64-encoded into the client
+  response. The lower cap reflects base64 inflation (~33%) and the memory/transport
+  cost of inlining; documents above it are returned as a download URL instead.
+
+### Where downloads go (remote vs local)
+
+The download tools branch on `_is_remote_session()`, which is true when an OAuth
+access token is present (HTTP mode) and false in local stdio mode. The token is
+the precise discriminator for the question that matters: can the user retrieve a
+file written to the server's filesystem?
+
+- **Remote (HTTP):** `docketbird_download_document` streams the file into memory
+  and returns it as an MCP **embedded resource** — a base64 blob with a stable
+  `docketbird://documents/{id}/{filename}` URI and a guessed MIME type — wrapped
+  in `_document_resource`. Files over the 50 MB cap are not inlined; the tool
+  returns the pre-signed S3 URL instead. The tool is registered with
+  `structured_output=False` so FastMCP returns the content blocks verbatim rather
+  than validating them against a wrapped string output schema.
+  `docketbird_download_files` returns a markdown list of per-document pre-signed
+  `docketbird_document_url` links (`_format_download_links`) instead of inlining a
+  whole case.
+- **Local (stdio):** passing a `save_path` keeps the original behavior — files
+  stream to that folder on the user's own machine via `_stream_to_file`. With no
+  `save_path`, stdio falls back to returning content the same way remote does.
 
 ## Security model (summary)
 

@@ -10,8 +10,8 @@ An MCP server for searching and downloading court documents via the DocketBird A
 | `docketbird_search_documents`  | Search documents within a case by keyword       |
 | `docketbird_list_cases`        | List cases for company or user scope            |
 | `docketbird_list_courts`       | Get court codes and case types (optional `search` filter) |
-| `docketbird_download_document` | Download a single document by ID                |
-| `docketbird_download_files`    | Download all available documents for a case     |
+| `docketbird_download_document` | Retrieve a single document's content (or save it locally in stdio) |
+| `docketbird_download_files`    | List a case's documents with direct download links (or save them locally in stdio) |
 | `docketbird_get_calendar`      | Get calendar entries (deadlines and hearings)   |
 | `docketbird_follow_case`       | Follow a case so DocketBird monitors new filings |
 
@@ -123,12 +123,17 @@ In stdio mode, the `DOCKETBIRD_API_KEY` env var is used directly (no OAuth).
 - Dependencies pinned to exact versions
 - Expired tokens, auth codes, and pending sessions are purged hourly (in both stdio and HTTP modes)
 
-> **Where downloads land:** `docketbird_download_document` and
-> `docketbird_download_files` write to the **machine running the server**, at the
-> `save_path` you provide. In stdio (local) mode that's your own machine. On a
-> remote HTTP deployment that's the server's container filesystem, not your
-> computer — so prefer reading/searching documents remotely and run downloads
-> via the local stdio setup when you need the files on disk.
+> **How downloads reach you:** the download tools adapt to the transport.
+> - **Remote (HTTP) connection:** `docketbird_download_document` returns the
+>   document's content to your client as an embedded resource (base64, capped at
+>   10 MB — larger files come back as a direct download link instead, since
+>   base64 inflates the payload and a whole case of inlined PDFs would be huge).
+>   `docketbird_download_files` returns a list of per-document pre-signed download
+>   links rather than inlining a whole case. Any `save_path` is ignored remotely,
+>   since it would write to the server's container, not your computer.
+> - **Local (stdio) mode:** pass a `save_path` and the files stream to that folder
+>   on your own machine, exactly as before. Omit `save_path` and the content is
+>   returned to your client instead.
 
 ## Development & Testing
 
@@ -141,7 +146,8 @@ pytest
 
 The suite (`tests/`) runs fully offline — network calls are faked — and covers
 the security helpers (path/URL validation, filename sanitization), pagination
-math, the rate limiter, error formatting, and the streaming download size cap.
+math, the rate limiter, error formatting, the streaming download size cap, and
+the remote-vs-local download behavior (inline content / links vs save-to-disk).
 
 For a deeper look at how the server is wired together (OAuth flow, request
 lifecycle, database schema, security model), see

@@ -10,6 +10,8 @@ In stdio mode, falls back to DOCKETBIRD_API_KEY env var.
 """
 
 import asyncio
+import base64
+import mimetypes
 import os
 import re
 import json
@@ -24,7 +26,7 @@ import httpx
 from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
-from mcp.types import ToolAnnotations
+from mcp.types import BlobResourceContents, EmbeddedResource, TextContent, ToolAnnotations
 from termcolor import cprint as _cprint
 from starlette.requests import Request
 from starlette.responses import JSONResponse
@@ -68,8 +70,14 @@ ALLOWED_DOWNLOAD_DOMAINS = {
     "api.docketbird.com",
 }
 
-# Max file size for downloads (50 MB)
+# Max file size for downloads to the server's disk (local stdio mode).
 MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024
+
+# Max file size to return inline to a remote client as a base64 blob. Smaller
+# than the disk cap: base64 inflates ~33% and the whole payload sits in memory
+# and the JSON-RPC response, so large filings are returned as a download URL
+# instead of being inlined.
+MAX_INLINE_SIZE = 10 * 1024 * 1024
 
 # Rate limiting
 RATE_LIMIT_REQUESTS = 30
@@ -434,12 +442,14 @@ class DownloadTooLarge(Exception):
     """Raised when a streamed download exceeds MAX_DOWNLOAD_SIZE."""
 
 
-async def _stream_to_file(s3_url: str, dest: Path) -> int:
-    """Stream a document from a validated S3 URL to dest with a hard size cap.
+async def _iter_capped_chunks(s3_url: str, max_bytes: int):
+    """Yield a validated S3 download in 8 KB chunks under a hard size cap.
 
-    Returns the number of bytes written. Validates the URL domain (SSRF
-    protection) first, raises DownloadTooLarge (after deleting the partial file)
-    if the response exceeds MAX_DOWNLOAD_SIZE, and lets httpx errors propagate.
+    The single place the download invariants live: it validates the URL domain
+    (SSRF protection) and requires HTTPS before opening the stream, and raises
+    DownloadTooLarge as soon as the running total would exceed max_bytes. When S3
+    declares a Content-Length over the cap, it bails before reading the body so an
+    over-cap file isn't transferred just to be discarded. httpx errors propagate.
     S3 URLs are pre-signed, so no API key is attached.
     """
     validate_download_url(s3_url)
@@ -447,15 +457,143 @@ async def _stream_to_file(s3_url: str, dest: Path) -> int:
     downloaded = 0
     async with client.stream("GET", s3_url) as response:
         response.raise_for_status()
+        # Early exit on the advertised size; the running total below is the
+        # authoritative guard since Content-Length may be absent, wrong, or
+        # malformed (so a non-numeric value is ignored rather than crashing).
+        try:
+            declared = int(response.headers.get("content-length") or 0)
+        except ValueError:
+            declared = 0
+        if declared > max_bytes:
+            raise DownloadTooLarge("document")
+        async for chunk in response.aiter_bytes(chunk_size=8192):
+            downloaded += len(chunk)
+            if downloaded > max_bytes:
+                raise DownloadTooLarge("document")
+            yield chunk
+
+
+async def _stream_to_file(s3_url: str, dest: Path) -> int:
+    """Stream a document from a validated S3 URL to dest with a hard size cap.
+
+    Returns the number of bytes written. Deletes any partial file and re-raises
+    if the download exceeds MAX_DOWNLOAD_SIZE (the disk cap).
+    """
+    # Validate before creating the file so a rejected domain leaves nothing behind.
+    validate_download_url(s3_url)
+    downloaded = 0
+    try:
         with open(dest, "wb") as f:
-            async for chunk in response.aiter_bytes(chunk_size=8192):
-                downloaded += len(chunk)
-                if downloaded > MAX_DOWNLOAD_SIZE:
-                    f.close()
-                    dest.unlink(missing_ok=True)
-                    raise DownloadTooLarge(dest.name)
+            async for chunk in _iter_capped_chunks(s3_url, MAX_DOWNLOAD_SIZE):
                 f.write(chunk)
+                downloaded += len(chunk)
+    except DownloadTooLarge:
+        dest.unlink(missing_ok=True)
+        raise
     return downloaded
+
+
+async def _stream_to_memory(s3_url: str) -> bytes:
+    """Stream a document from a validated S3 URL into memory with a hard size cap.
+
+    The in-memory sibling of _stream_to_file, used to return document content to
+    the client (remote HTTP mode) instead of writing to the server's disk. Shares
+    the SSRF/HTTPS validation via _iter_capped_chunks but applies the smaller
+    MAX_INLINE_SIZE cap, since the bytes are base64-encoded into the response.
+    """
+    buffer = bytearray()
+    async for chunk in _iter_capped_chunks(s3_url, MAX_INLINE_SIZE):
+        buffer += chunk
+    return bytes(buffer)
+
+
+def _is_remote_session() -> bool:
+    """True when serving a remote (HTTP/OAuth) client, False in local stdio mode.
+
+    The discriminator is OAuth-token presence: the SDK's auth middleware sets it
+    only in HTTP mode, so it precisely captures the question that matters for
+    downloads — can the user retrieve a file written to the server's filesystem?
+    Remote: no (return content to the client). Local stdio: yes (save to disk).
+    """
+    return get_access_token() is not None
+
+
+def _guess_mime_type(filename: str) -> str:
+    """Best-effort MIME type for a downloaded document.
+
+    Court filings are overwhelmingly PDFs, so that is the fallback when the
+    extension is unknown.
+    """
+    mime, _ = mimetypes.guess_type(filename)
+    return mime or "application/pdf"
+
+
+def _document_resource(document_id: str, filename: str, content: bytes) -> EmbeddedResource:
+    """Wrap downloaded bytes as an MCP embedded resource (base64 blob).
+
+    Uses a stable docketbird:// URI rather than the pre-signed S3 URL so no
+    short-lived signature leaks into the resource identity.
+    """
+    return EmbeddedResource(
+        type="resource",
+        resource=BlobResourceContents(
+            uri=f"docketbird://documents/{document_id}/{filename}",
+            mimeType=_guess_mime_type(filename),
+            blob=base64.b64encode(content).decode("ascii"),
+        ),
+    )
+
+
+def _format_download_links(case_id: str, documents: list[dict[str, Any]]) -> str:
+    """Render available documents as a markdown list of direct download links.
+
+    Used for bulk retrieval over a remote connection, where inlining every PDF
+    would be far too large. Each available document exposes its pre-signed
+    ``docketbird_document_url`` (already returned by the API) so the client can
+    fetch it directly. Restricted and not-yet-available filings are summarized
+    as counts rather than linked. URLs are run through the same SSRF/HTTPS
+    allowlist as the streaming path, so only allowlisted https links are surfaced.
+    """
+    available = []
+    restricted = 0
+    unavailable = 0
+    for doc in documents:
+        if doc.get("restricted"):
+            restricted += 1
+            continue
+        s3_url = doc.get("docketbird_document_url")
+        if not s3_url:
+            unavailable += 1
+            continue
+        try:
+            validate_download_url(s3_url)
+        except ValueError:
+            # An off-allowlist or non-https URL should never be relayed to the
+            # client; treat it as not (safely) available.
+            unavailable += 1
+            continue
+        available.append(doc)
+
+    lines = [f"## Documents for {case_id} ({len(available)} available to download)"]
+    if not available:
+        lines.append("\n_No documents are currently available for direct download._")
+    for doc in available:
+        title = doc.get("title", "N/A")
+        lines.append(f"\n**{title}**")
+        lines.append(f"- ID: {doc.get('id')}")
+        if doc.get("filing_date"):
+            lines.append(f"- Filed: {doc.get('filing_date')}")
+        lines.append(f"- Download (link expires shortly): {doc.get('docketbird_document_url')}")
+
+    if restricted:
+        lines.append(f"\n**Restricted**: {restricted} documents (sealed/access-limited)")
+    if unavailable:
+        lines.append(f"**Not yet available**: {unavailable} documents")
+    lines.append(
+        "\n_Tip: call `docketbird_download_document` with a document ID to get that "
+        "file's content directly._"
+    )
+    return "\n".join(lines)
 
 
 # =============================================================================
@@ -734,9 +872,14 @@ async def docketbird_list_courts(search: str = "") -> str:
         return f"Error loading court data: {e}"
 
 
-@mcp.tool(annotations=DOWNLOAD_TOOL)
-async def docketbird_download_document(document_id: str, save_path: str) -> str:
+@mcp.tool(annotations=DOWNLOAD_TOOL, structured_output=False)
+async def docketbird_download_document(document_id: str, save_path: str | None = None) -> Any:
     """Download a specific document by ID.
+
+    Returns the document content to **you** (the client) as an embedded resource
+    so you can read or save it — this works over the remote HTTP connection. In
+    local stdio mode, passing ``save_path`` instead writes the file to that folder
+    on your own machine (the server runs locally there).
 
     When to use:
     - User wants to retrieve a specific filing
@@ -745,14 +888,29 @@ async def docketbird_download_document(document_id: str, save_path: str) -> str:
 
     Args:
         document_id: DocketBird document ID
-        save_path: Folder path where file should be saved
+        save_path: Local folder to save into. Only honored in local stdio mode,
+                   where the server shares your filesystem. Ignored over a remote
+                   HTTP connection (the file would land on the server, not your
+                   machine), where the content is returned to you directly.
+
+    Returns:
+        - Remote, or local with no save_path: a list of content blocks — a text
+          summary plus an embedded resource holding the document bytes (base64),
+          capped at MAX_INLINE_SIZE. If the document exceeds that cap, returns a
+          text message with its direct download URL instead of inlining it.
+        - Local stdio with save_path: a text confirmation of the saved file path.
+        - On error / unavailable / restricted: a plain text message.
     """
     try:
         api_key = get_user_api_key()
         cprint(f"[MCP] docketbird_download_document: {document_id}", "green")
 
-        # Validate path (security)
-        save_dir = validate_save_path(save_path)
+        # Honor save_path only where it is useful: local stdio mode, where the
+        # server shares the user's filesystem. Remote clients can't reach the
+        # server's disk, so the path is ignored there (and not validated, since a
+        # value we never use shouldn't be able to fail the request).
+        save_to_disk = bool(save_path) and not _is_remote_session()
+        save_dir = validate_save_path(save_path) if save_to_disk else None
 
         data = await make_request(f"/documents/{document_id}", api_key=api_key)
         document = data.get("data", {}).get("document", {})
@@ -770,17 +928,37 @@ async def docketbird_download_document(document_id: str, save_path: str) -> str:
         # Prefer the API-provided custom filename; fall back to the S3 URL.
         # Always sanitize (path-safety) regardless of source.
         filename = sanitize_filename(document.get("custom_filename") or s3_url)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        full_path = save_dir / filename
+        title = document.get("title") or filename
 
-        cprint(f"[MCP] Downloading from S3: {s3_url[:50]}...", "cyan")
+        if save_to_disk:
+            save_dir.mkdir(parents=True, exist_ok=True)
+            full_path = save_dir / filename
+            cprint(f"[MCP] Downloading from S3 to disk: {s3_url[:50]}...", "cyan")
+            try:
+                downloaded_bytes = await _stream_to_file(s3_url, full_path)
+            except DownloadTooLarge:
+                return f"Download aborted: file exceeds {MAX_DOWNLOAD_SIZE // (1024 * 1024)}MB limit"
+            cprint(f"[MCP] Downloaded: {full_path} ({downloaded_bytes} bytes)", "green")
+            return f"Downloaded: {title} -> {full_path}"
+
+        # Return content to the client (remote HTTP, or local with no save_path).
+        cprint(f"[MCP] Streaming to client: {s3_url[:50]}...", "cyan")
         try:
-            downloaded_bytes = await _stream_to_file(s3_url, full_path)
+            content = await _stream_to_memory(s3_url)
         except DownloadTooLarge:
-            return f"Download aborted: file exceeds {MAX_DOWNLOAD_SIZE // (1024 * 1024)}MB limit"
+            limit_mb = MAX_INLINE_SIZE // (1024 * 1024)
+            return (
+                f"'{title}' exceeds the {limit_mb}MB inline limit, so it was not "
+                f"returned directly. Download it from this link instead (expires "
+                f"shortly): {s3_url}"
+            )
 
-        cprint(f"[MCP] Downloaded: {full_path} ({downloaded_bytes} bytes)", "green")
-        return f"Downloaded: {document.get('title')} -> {full_path}"
+        cprint(f"[MCP] Returning {len(content)} bytes to client as embedded resource", "green")
+        summary = TextContent(
+            type="text",
+            text=f"Retrieved '{title}' ({len(content)} bytes) as {filename}.",
+        )
+        return [summary, _document_resource(document_id, filename, content)]
 
     except ValueError as e:
         return f"Security error: {e}"
@@ -789,27 +967,47 @@ async def docketbird_download_document(document_id: str, save_path: str) -> str:
 
 
 @mcp.tool(annotations=DOWNLOAD_TOOL)
-async def docketbird_download_files(case_id: str, save_path: str) -> str:
-    """Download all available documents for a case.
+async def docketbird_download_files(case_id: str, save_path: str | None = None) -> str:
+    """List or save every available document for a case.
+
+    A case can hold many large PDFs, so over a remote HTTP connection this returns
+    a list of per-document **direct download links** (pre-signed, short-lived)
+    rather than inlining every file — fetch the ones you need, or call
+    ``docketbird_download_document`` for a single document's content. In local
+    stdio mode, passing ``save_path`` instead streams every file to that folder on
+    your own machine.
 
     When to use:
-    - User wants complete case file archive
+    - User wants the complete case file archive
     - Bulk document retrieval
-    - Downloading all available filings at once
+    - Surveying which filings are available to download
 
     Args:
         case_id: DocketBird case ID
-        save_path: Folder path where files should be saved
+        save_path: Local folder to save into. Only honored in local stdio mode,
+                   where the server shares your filesystem. Over a remote HTTP
+                   connection it is ignored and download links are returned instead.
+
+    Returns:
+        str: Markdown. Remote (or local with no save_path) lists each available
+        document's title, ID, and direct download URL, plus counts of
+        restricted/unavailable filings. Local stdio with save_path reports how
+        many files were saved to disk and any that were skipped or failed.
     """
     try:
         api_key = get_user_api_key()
         cprint(f"[MCP] docketbird_download_files: {case_id}", "green")
 
-        # Validate path (security)
-        save_dir = validate_save_path(save_path)
+        save_to_disk = bool(save_path) and not _is_remote_session()
+        # Validate the path only when we'll actually write to disk; remote clients
+        # can't reach the server's filesystem, so the path is ignored there.
+        save_dir = validate_save_path(save_path) if save_to_disk else None
 
         data = await make_request("/documents", params={"case_id": case_id}, api_key=api_key)
         documents = data.get("data", {}).get("documents", [])
+
+        if not save_to_disk:
+            return _format_download_links(case_id, documents)
 
         downloaded = []
         skipped = []
