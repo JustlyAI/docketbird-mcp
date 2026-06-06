@@ -16,9 +16,8 @@ An MCP server for searching and downloading court documents via the DocketBird A
 | `docketbird_follow_case`       | Follow a case so DocketBird monitors new filings |
 
 > **Using these tools from an agent:** a ready-to-install Claude skill lives in
-> [`skills/docketbird-mcp/`](skills/docketbird-mcp/SKILL.md). It documents the
-> case-ID format, the find → inspect → search → download workflow, the
-> remote-vs-local download behavior, and known limitations.
+> [`skills/docketbird-mcp/`](skills/docketbird-mcp/SKILL.md), covering the case-ID
+> format, each tool, and common research workflows.
 
 ## Requirements
 
@@ -128,17 +127,10 @@ In stdio mode, the `DOCKETBIRD_API_KEY` env var is used directly (no OAuth).
 - Dependencies pinned to exact versions
 - Expired tokens, auth codes, and pending sessions are purged hourly (in both stdio and HTTP modes)
 
-> **How downloads reach you:** the download tools adapt to the transport.
-> - **Remote (HTTP) connection:** `docketbird_download_document` returns the
->   document's content to your client as an embedded resource (base64, capped at
->   10 MB — larger files come back as a direct download link instead, since
->   base64 inflates the payload and a whole case of inlined PDFs would be huge).
->   `docketbird_download_files` returns a list of per-document pre-signed download
->   links rather than inlining a whole case. Any `save_path` is ignored remotely,
->   since it would write to the server's container, not your computer.
-> - **Local (stdio) mode:** pass a `save_path` and the files stream to that folder
->   on your own machine, exactly as before. Omit `save_path` and the content is
->   returned to your client instead.
+> **Downloads — where files go:** over a remote (HTTP) connection the download
+> tools return document content and links to your client; a `save_path` is ignored
+> (it would write to the server, not your machine). In local stdio mode, pass a
+> `save_path` to save to your own machine.
 
 ## Development & Testing
 
@@ -170,14 +162,6 @@ lifecycle, database schema, security model), see
 - **Changed your DocketBird API key but tools still fail:** use `/change-api-key`.
   It validates the new key against DocketBird and clears stale access tokens so
   the new key takes effect immediately.
-- **A case's documents won't load (504 / "Gateway timeout"):** very large dockets
-  can exceed DocketBird's ~29s API-gateway limit on `GET /documents`, which backs
-  `docketbird_get_case_details`, `docketbird_search_documents`, and
-  `docketbird_download_files`. This is a **server-side DocketBird limitation**, not
-  an MCP-server bug — it reproduces with a raw API call and no parameter shrinks
-  the request. See [`DOCKETBIRD_API_BUG_REPORT.md`](DOCKETBIRD_API_BUG_REPORT.md).
-  Other endpoints for the same case (calendar, single-document fetch by ID) are
-  unaffected.
 
 ## Deployment
 
@@ -187,9 +171,6 @@ Deployed via Docker and GitHub Actions. Pushes to `main` trigger automatic deplo
 - Docker volume: `docketbird-data` at `/app/data` (SQLite auth database)
 - Health check: `https://app.docketbird-mcp.com/health`
 - Caddy reverse proxy handles HTTPS (Let's Encrypt)
-- DNS is managed by Cloudflare in **DNS-only** mode (not proxied): names resolve
-  to the droplet and requests hit Caddy directly — Cloudflare is not in the
-  request path (no CDN/WAF/TLS termination by Cloudflare).
 
 ### Local Docker Build
 

@@ -59,32 +59,22 @@ or `docketbird_search_documents`, which list each document as `[id] Title …`.
 - `docketbird_get_calendar(case_id)` for hearings and deadlines.
 - `docketbird_follow_case(case_id)` to enable new-filing monitoring (federal ~2×/week, state ~1×/week).
 
-## Downloads: what you get back depends on the connection
+## Downloads
 
-The download tools adapt to the transport. Do not assume a file landed on the
-user's disk — over the hosted server it usually did not.
+Over the hosted server (remote/HTTP — the common case), don't assume a file
+landed on disk:
 
-- **Remote (the hosted server over HTTP — the common case):**
-  - `docketbird_download_document` returns the document **content to the client** as an embedded resource (base64), up to 10 MB. Larger documents come back as a **direct, short-lived download URL** instead of inline bytes.
-  - `docketbird_download_files` returns a **list of per-document download URLs**, not the files themselves (a case can be many large PDFs). Fetch the ones you need, or call `docketbird_download_document` per ID.
-  - A `save_path` argument is **ignored** remotely — it would write to the server, not the user's machine.
-- **Local (stdio) mode:** pass `save_path` and files stream to that folder on the user's own machine. Omit it and content is returned to the client as above.
+- `docketbird_download_document` returns the document content to the client (base64, up to 10 MB; larger documents come back as a short-lived download URL).
+- `docketbird_download_files` returns per-document download URLs, not the files (a case can be many large PDFs).
+- A `save_path` is ignored remotely — it would write to the server, not the user's machine.
 
-Restricted (sealed / PACER-limited) documents cannot be downloaded; not-yet-processed
-documents have no download URL yet. Both are reported in the result, not errors.
+In local stdio mode, pass `save_path` to stream files to the user's own machine.
+Restricted (sealed) and not-yet-processed documents are reported, not downloaded.
 
-## Known limitation: large dockets can time out
+## Notes
 
-`docketbird_get_case_details`, `docketbird_search_documents`, and
-`docketbird_download_files` all depend on DocketBird's `GET /documents`, which can
-return a **504 "Gateway timeout"** (~29 s) for unusually large dockets. This is a
-**DocketBird server-side limit** — no MCP-side change or retry fixes it, and there
-is currently no working pagination parameter to shrink the request. When it happens:
-
-- The case is not fully inaccessible: `docketbird_get_calendar`, single-document
-  fetch by a known ID, and case metadata still work. A `get_case_details` timeout
-  only means the document *list* couldn't be assembled.
-- Treat it as a DocketBird issue to report, not something to retry indefinitely.
+- The document-list tools (`docketbird_get_case_details`, `docketbird_search_documents`, `docketbird_download_files`) can time out (504) on unusually large dockets — a DocketBird-side limit, so don't retry blindly. Calendar and single-document-by-ID fetches are unaffected.
+- The calendar is read-only here: `docketbird_get_calendar` returns "no calendar entries" when a case has no autocalendar, and there is no MCP tool to create one.
 
 ## Errors
 
