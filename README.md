@@ -15,6 +15,11 @@ An MCP server for searching and downloading court documents via the DocketBird A
 | `docketbird_get_calendar`      | Get calendar entries (deadlines and hearings)   |
 | `docketbird_follow_case`       | Follow a case so DocketBird monitors new filings |
 
+> **Using these tools from an agent:** a ready-to-install Claude skill lives in
+> [`skills/docketbird-mcp/`](skills/docketbird-mcp/SKILL.md). It documents the
+> case-ID format, the find → inspect → search → download workflow, the
+> remote-vs-local download behavior, and known limitations.
+
 ## Requirements
 
 - Python 3.11
@@ -165,6 +170,14 @@ lifecycle, database schema, security model), see
 - **Changed your DocketBird API key but tools still fail:** use `/change-api-key`.
   It validates the new key against DocketBird and clears stale access tokens so
   the new key takes effect immediately.
+- **A case's documents won't load (504 / "Gateway timeout"):** very large dockets
+  can exceed DocketBird's ~29s API-gateway limit on `GET /documents`, which backs
+  `docketbird_get_case_details`, `docketbird_search_documents`, and
+  `docketbird_download_files`. This is a **server-side DocketBird limitation**, not
+  an MCP-server bug — it reproduces with a raw API call and no parameter shrinks
+  the request. See [`DOCKETBIRD_API_BUG_REPORT.md`](DOCKETBIRD_API_BUG_REPORT.md).
+  Other endpoints for the same case (calendar, single-document fetch by ID) are
+  unaffected.
 
 ## Deployment
 
@@ -174,6 +187,9 @@ Deployed via Docker and GitHub Actions. Pushes to `main` trigger automatic deplo
 - Docker volume: `docketbird-data` at `/app/data` (SQLite auth database)
 - Health check: `https://app.docketbird-mcp.com/health`
 - Caddy reverse proxy handles HTTPS (Let's Encrypt)
+- DNS is managed by Cloudflare in **DNS-only** mode (not proxied): names resolve
+  to the droplet and requests hit Caddy directly — Cloudflare is not in the
+  request path (no CDN/WAF/TLS termination by Cloudflare).
 
 ### Local Docker Build
 
