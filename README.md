@@ -15,6 +15,10 @@ An MCP server for searching and downloading court documents via the DocketBird A
 | `docketbird_get_calendar`      | Get calendar entries (deadlines and hearings)   |
 | `docketbird_follow_case`       | Follow a case so DocketBird monitors new filings |
 
+> **Using these tools from an agent:** a ready-to-install Claude skill lives in
+> [`skills/docketbird-mcp/`](skills/docketbird-mcp/SKILL.md), covering the case-ID
+> format, each tool, and common research workflows.
+
 ## Requirements
 
 - Python 3.11
@@ -123,17 +127,10 @@ In stdio mode, the `DOCKETBIRD_API_KEY` env var is used directly (no OAuth).
 - Dependencies pinned to exact versions
 - Expired tokens, auth codes, and pending sessions are purged hourly (in both stdio and HTTP modes)
 
-> **How downloads reach you:** the download tools adapt to the transport.
-> - **Remote (HTTP) connection:** `docketbird_download_document` returns the
->   document's content to your client as an embedded resource (base64, capped at
->   10 MB — larger files come back as a direct download link instead, since
->   base64 inflates the payload and a whole case of inlined PDFs would be huge).
->   `docketbird_download_files` returns a list of per-document pre-signed download
->   links rather than inlining a whole case. Any `save_path` is ignored remotely,
->   since it would write to the server's container, not your computer.
-> - **Local (stdio) mode:** pass a `save_path` and the files stream to that folder
->   on your own machine, exactly as before. Omit `save_path` and the content is
->   returned to your client instead.
+> **Downloads — where files go:** over a remote (HTTP) connection the download
+> tools return document content and links to your client; a `save_path` is ignored
+> (it would write to the server, not your machine). In local stdio mode, pass a
+> `save_path` to save to your own machine.
 
 ## Development & Testing
 
