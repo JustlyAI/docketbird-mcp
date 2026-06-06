@@ -172,7 +172,10 @@ Deployed via Docker and GitHub Actions. Pushes to `main` trigger automatic deplo
 
 - Domain: `app.docketbird-mcp.com`
 - Docker volume: `docketbird-data` at `/app/data` (SQLite auth database)
-- Health check: `https://app.docketbird-mcp.com/health`
+- Health check: `https://app.docketbird-mcp.com/health` — returns
+  `{"status":"ok","service":"docketbird-mcp","version":"<git-sha>"}`, where
+  `version` is the deployed commit (set by the deploy workflow via `GIT_SHA`), so
+  a single `curl` confirms exactly which build is live.
 - Caddy reverse proxy handles HTTPS (Let's Encrypt)
 
 ### Local Docker Build
