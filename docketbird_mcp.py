@@ -60,6 +60,10 @@ SCRIPT_DIR = Path(__file__).parent.resolve()
 BASE_URL = "https://api.docketbird.com"
 SERVER_URL = os.getenv("SERVER_URL", "http://localhost:8080")
 
+# Deployed git commit, surfaced at /health so a single curl proves which build is
+# live. The deploy pipeline injects it via `-e GIT_SHA`; "dev" when unset locally.
+GIT_SHA = os.getenv("GIT_SHA", "dev")
+
 # Fallback API key for stdio mode (no OAuth in stdio)
 FALLBACK_API_KEY = os.getenv("DOCKETBIRD_API_KEY", "")
 
@@ -1141,6 +1145,11 @@ mcp_app = mcp.streamable_http_app()
 _cleanup_task: asyncio.Task | None = None
 
 
+def _health_payload() -> dict[str, str]:
+    """Body for GET /health: liveness plus the deployed commit for verifiability."""
+    return {"status": "ok", "service": "docketbird-mcp", "version": GIT_SHA}
+
+
 async def app(scope, receive, send):
     """ASGI app: custom routes + rate limiting + MCP/OAuth.
 
@@ -1185,7 +1194,7 @@ async def app(scope, receive, send):
 
     # Health check: no rate limit
     if path == "/health":
-        response = JSONResponse({"status": "ok", "service": "docketbird-mcp"})
+        response = JSONResponse(_health_payload())
         await response(scope, receive, send)
         return
 
