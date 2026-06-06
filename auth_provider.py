@@ -17,6 +17,7 @@ Flow:
 import json
 import os
 import secrets
+import sys
 import time
 from html import escape
 from pathlib import Path
@@ -35,7 +36,13 @@ from mcp.server.auth.provider import (
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
 from starlette.requests import Request
 from starlette.responses import HTMLResponse, RedirectResponse
-from termcolor import cprint
+from termcolor import cprint as _cprint
+
+
+def cprint(*args, **kwargs):
+    """Log to stderr, never stdout (see docketbird_mcp.cprint for rationale)."""
+    kwargs.setdefault("file", sys.stderr)
+    _cprint(*args, **kwargs)
 
 # Security headers for all HTML responses
 SECURITY_HEADERS = {
@@ -611,15 +618,12 @@ class DocketBirdAuthProvider:
 
 # =============================================================================
 # HTML Templates
+#
+# All auth pages share one chrome (doctype, head, styles, centered card). The
+# shared shell lives in _page(); each page only supplies its inner card body.
 # =============================================================================
 
-SIGNUP_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>DocketBird MCP - Sign Up</title>
-    <style>
+_PAGE_STYLE = """
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
                background: #f5f5f5; display: flex; justify-content: center; align-items: center;
@@ -639,14 +643,39 @@ SIGNUP_HTML = """<!DOCTYPE html>
                  margin-bottom: 16px; font-size: 14px; }
         .success { background: #f0fdf4; color: #16a34a; padding: 10px; border-radius: 8px;
                    margin-bottom: 16px; font-size: 14px; }
-        .login-link { text-align: center; margin-top: 16px; font-size: 14px; color: #666; }
-        .login-link a { color: #1a73e8; text-decoration: none; }
+        .link { text-align: center; margin-top: 16px; font-size: 14px; color: #666; }
+        .link a { color: #1a73e8; text-decoration: none; }
         .help { font-size: 12px; color: #999; margin-top: -12px; margin-bottom: 16px; }
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>DocketBird MCP</h1>
+"""
+
+
+def _page(title: str, body: str) -> str:
+    """Wrap an inner card body in the shared page chrome.
+
+    `body` is inserted verbatim, so it may contain literal `{...}` placeholders
+    (e.g. SIGNUP's `{message}`) without being treated as format fields.
+    """
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '    <meta charset="utf-8">\n'
+        '    <meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"    <title>{title}</title>\n"
+        f"    <style>{_PAGE_STYLE}    </style>\n"
+        "</head>\n"
+        "<body>\n"
+        '    <div class="card">\n'
+        f"{body}\n"
+        "    </div>\n"
+        "</body>\n"
+        "</html>"
+    )
+
+
+SIGNUP_HTML = _page(
+    "DocketBird MCP - Sign Up",
+    """        <h1>DocketBird MCP</h1>
         <p class="subtitle">Connect your DocketBird account to use court document tools in Claude.</p>
         {message}
         <form method="POST" action="/signup">
@@ -665,10 +694,8 @@ SIGNUP_HTML = """<!DOCTYPE html>
 
             <button type="submit">Create Account</button>
         </form>
-        <p class="login-link">Already have an account? <a href="/login">Log in</a></p>
-    </div>
-</body>
-</html>"""
+        <p class="link">Already have an account? <a href="/login">Log in</a></p>""",
+)
 
 
 def _login_html(auth_session: str = "", error: str = "") -> str:
@@ -680,38 +707,7 @@ def _login_html(auth_session: str = "", error: str = "") -> str:
         if auth_session
         else ""
     )
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>DocketBird MCP - Log In</title>
-    <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-               background: #f5f5f5; display: flex; justify-content: center; align-items: center;
-               min-height: 100vh; padding: 20px; }}
-        .card {{ background: white; border-radius: 12px; padding: 40px; max-width: 420px;
-                width: 100%; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
-        h1 {{ font-size: 24px; margin-bottom: 8px; color: #1a1a1a; }}
-        p.subtitle {{ color: #666; margin-bottom: 24px; font-size: 14px; }}
-        label {{ display: block; font-size: 14px; font-weight: 500; margin-bottom: 4px; color: #333; }}
-        input[type="email"], input[type="password"] {{
-            width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px;
-            font-size: 14px; margin-bottom: 16px; }}
-        input:focus {{ outline: none; border-color: #4a90d9; box-shadow: 0 0 0 2px rgba(74,144,217,0.2); }}
-        button {{ width: 100%; padding: 12px; background: #1a73e8; color: white; border: none;
-                 border-radius: 8px; font-size: 16px; font-weight: 500; cursor: pointer; }}
-        button:hover {{ background: #1557b0; }}
-        .error {{ background: #fef2f2; color: #dc2626; padding: 10px; border-radius: 8px;
-                 margin-bottom: 16px; font-size: 14px; }}
-        .signup-link {{ text-align: center; margin-top: 16px; font-size: 14px; color: #666; }}
-        .signup-link a {{ color: #1a73e8; text-decoration: none; }}
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>DocketBird MCP</h1>
+    body = f"""        <h1>DocketBird MCP</h1>
         <p class="subtitle">Log in with your MCP server credentials to connect to Claude.</p>
         {message}
         <form method="POST" action="/login">
@@ -732,48 +728,14 @@ def _login_html(auth_session: str = "", error: str = "") -> str:
             btn.textContent = 'Logging in...';
         }});
         </script>
-        <p class="signup-link">No account? <a href="/signup">Sign up</a></p>
-        <p class="signup-link"><a href="/change-password">Forgot your password?</a> &middot; <a href="/change-api-key">Update your API key?</a></p>
-    </div>
-</body>
-</html>"""
+        <p class="link">No account? <a href="/signup">Sign up</a></p>
+        <p class="link"><a href="/change-password">Forgot your password?</a> &middot; <a href="/change-api-key">Update your API key?</a></p>"""
+    return _page("DocketBird MCP - Log In", body)
 
 
 def _change_password_html(message: str = "") -> str:
     """Generate change password page HTML."""
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>DocketBird MCP - Change Password</title>
-    <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-               background: #f5f5f5; display: flex; justify-content: center; align-items: center;
-               min-height: 100vh; padding: 20px; }}
-        .card {{ background: white; border-radius: 12px; padding: 40px; max-width: 420px;
-                width: 100%; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
-        h1 {{ font-size: 24px; margin-bottom: 8px; color: #1a1a1a; }}
-        p.subtitle {{ color: #666; margin-bottom: 24px; font-size: 14px; }}
-        label {{ display: block; font-size: 14px; font-weight: 500; margin-bottom: 4px; color: #333; }}
-        input {{ width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px;
-                font-size: 14px; margin-bottom: 16px; }}
-        input:focus {{ outline: none; border-color: #4a90d9; box-shadow: 0 0 0 2px rgba(74,144,217,0.2); }}
-        button {{ width: 100%; padding: 12px; background: #1a73e8; color: white; border: none;
-                 border-radius: 8px; font-size: 16px; font-weight: 500; cursor: pointer; }}
-        button:hover {{ background: #1557b0; }}
-        .error {{ background: #fef2f2; color: #dc2626; padding: 10px; border-radius: 8px;
-                 margin-bottom: 16px; font-size: 14px; }}
-        .success {{ background: #f0fdf4; color: #16a34a; padding: 10px; border-radius: 8px;
-                   margin-bottom: 16px; font-size: 14px; }}
-        .login-link {{ text-align: center; margin-top: 16px; font-size: 14px; color: #666; }}
-        .login-link a {{ color: #1a73e8; text-decoration: none; }}
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>Change Password</h1>
+    body = f"""        <h1>Change Password</h1>
         <p class="subtitle">Enter your current credentials and choose a new password.</p>
         {message}
         <form method="POST" action="/change-password">
@@ -794,47 +756,13 @@ def _change_password_html(message: str = "") -> str:
 
             <button type="submit">Change Password</button>
         </form>
-        <p class="login-link"><a href="/login">Back to login</a></p>
-    </div>
-</body>
-</html>"""
+        <p class="link"><a href="/login">Back to login</a></p>"""
+    return _page("DocketBird MCP - Change Password", body)
 
 
 def _change_api_key_html(message: str = "") -> str:
     """Generate change API key page HTML."""
-    return f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>DocketBird MCP - Change API Key</title>
-    <style>
-        * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-               background: #f5f5f5; display: flex; justify-content: center; align-items: center;
-               min-height: 100vh; padding: 20px; }}
-        .card {{ background: white; border-radius: 12px; padding: 40px; max-width: 420px;
-                width: 100%; box-shadow: 0 2px 8px rgba(0,0,0,0.08); }}
-        h1 {{ font-size: 24px; margin-bottom: 8px; color: #1a1a1a; }}
-        p.subtitle {{ color: #666; margin-bottom: 24px; font-size: 14px; }}
-        label {{ display: block; font-size: 14px; font-weight: 500; margin-bottom: 4px; color: #333; }}
-        input {{ width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 8px;
-                font-size: 14px; margin-bottom: 16px; }}
-        input:focus {{ outline: none; border-color: #4a90d9; box-shadow: 0 0 0 2px rgba(74,144,217,0.2); }}
-        button {{ width: 100%; padding: 12px; background: #1a73e8; color: white; border: none;
-                 border-radius: 8px; font-size: 16px; font-weight: 500; cursor: pointer; }}
-        button:hover {{ background: #1557b0; }}
-        .error {{ background: #fef2f2; color: #dc2626; padding: 10px; border-radius: 8px;
-                 margin-bottom: 16px; font-size: 14px; }}
-        .success {{ background: #f0fdf4; color: #16a34a; padding: 10px; border-radius: 8px;
-                   margin-bottom: 16px; font-size: 14px; }}
-        .login-link {{ text-align: center; margin-top: 16px; font-size: 14px; color: #666; }}
-        .login-link a {{ color: #1a73e8; text-decoration: none; }}
-    </style>
-</head>
-<body>
-    <div class="card">
-        <h1>Change API Key</h1>
+    body = f"""        <h1>Change API Key</h1>
         <p class="subtitle">Authenticate, then enter your new DocketBird API key.</p>
         {message}
         <form method="POST" action="/change-api-key">
@@ -851,10 +779,8 @@ def _change_api_key_html(message: str = "") -> str:
 
             <button type="submit">Change API Key</button>
         </form>
-        <p class="login-link"><a href="/login">Back to login</a></p>
-    </div>
-</body>
-</html>"""
+        <p class="link"><a href="/login">Back to login</a></p>"""
+    return _page("DocketBird MCP - Change API Key", body)
 
 
 # =============================================================================

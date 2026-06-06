@@ -13,6 +13,7 @@ import asyncio
 import os
 import re
 import json
+import sys
 import time
 from contextlib import asynccontextmanager
 from typing import Literal, Any
@@ -24,9 +25,20 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
-from termcolor import cprint
+from termcolor import cprint as _cprint
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+
+def cprint(*args, **kwargs):
+    """Log to stderr, never stdout.
+
+    The stdio transport speaks JSON-RPC over stdout; any stray stdout write
+    corrupts that stream and breaks the client. Routing all diagnostic output
+    to stderr keeps stdio mode working and is harmless in HTTP mode.
+    """
+    kwargs.setdefault("file", sys.stderr)
+    _cprint(*args, **kwargs)
 
 from auth_provider import (
     AuthDB,
@@ -81,7 +93,8 @@ async def _periodic_cleanup():
         await asyncio.sleep(3600)  # Run every hour
         try:
             await auth_db.cleanup_expired()
-            cprint("[MCP] Cleaned up expired auth records", "yellow")
+            pruned = rate_limiter.prune()
+            cprint(f"[MCP] Cleaned up expired auth records (pruned {pruned} rate-limit entries)", "yellow")
         except Exception as e:
             cprint(f"[MCP] Cleanup error: {e}", "red")
 
@@ -288,17 +301,14 @@ def handle_api_error(error: Exception, operation: str) -> str:
 
 
 def validate_save_path(save_path: str) -> Path:
-    """Validate save path to prevent path traversal attacks."""
+    """Validate a save path to prevent path traversal attacks.
+
+    Rejects any path containing '..' before resolution. (After .resolve() the
+    string can no longer contain '..', so there is nothing further to check.)
+    """
     if ".." in save_path:
         raise ValueError("Path traversal not allowed: '..' detected in path")
-
-    resolved = Path(save_path).expanduser().resolve()
-
-    # Ensure the resolved path doesn't contain traversal after resolution
-    if ".." in str(resolved):
-        raise ValueError("Path traversal detected after resolution")
-
-    return resolved
+    return Path(save_path).expanduser().resolve()
 
 
 def validate_download_url(url: str) -> str:
@@ -360,6 +370,18 @@ class RateLimiter:
         self._requests[client_ip] = timestamps
         return True
 
+    def prune(self) -> int:
+        """Drop IPs with no requests inside the current window.
+
+        Called periodically so the map doesn't grow unboundedly as unique client
+        IPs come and go. Returns the number of entries removed.
+        """
+        cutoff = time.monotonic() - self.window_seconds
+        stale = [ip for ip, ts in self._requests.items() if not any(t > cutoff for t in ts)]
+        for ip in stale:
+            del self._requests[ip]
+        return len(stale)
+
 
 rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
 
@@ -379,6 +401,61 @@ def get_client_ip(scope) -> str:
     if client:
         return client[0]
     return "unknown"
+
+
+# =============================================================================
+# Pagination + Download Helpers
+# =============================================================================
+
+MAX_PAGE_SIZE = 50
+
+
+def _clamp_pagination(page: int, page_size: int) -> tuple[int, int]:
+    """Clamp pagination args to safe ranges.
+
+    Guards against page < 1 (which yields negative slice indices) and
+    page_size <= 0 (which causes a ZeroDivisionError when computing total_pages).
+    """
+    return max(page, 1), max(1, min(page_size, MAX_PAGE_SIZE))
+
+
+def _paginate(items: list[Any], page: int, page_size: int) -> tuple[list[Any], int, int]:
+    """Slice items for the given (already clamped) page.
+
+    Returns (page_items, total, total_pages).
+    """
+    total = len(items)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    start = (page - 1) * page_size
+    return items[start : start + page_size], total, total_pages
+
+
+class DownloadTooLarge(Exception):
+    """Raised when a streamed download exceeds MAX_DOWNLOAD_SIZE."""
+
+
+async def _stream_to_file(s3_url: str, dest: Path) -> int:
+    """Stream a document from a validated S3 URL to dest with a hard size cap.
+
+    Returns the number of bytes written. Validates the URL domain (SSRF
+    protection) first, raises DownloadTooLarge (after deleting the partial file)
+    if the response exceeds MAX_DOWNLOAD_SIZE, and lets httpx errors propagate.
+    S3 URLs are pre-signed, so no API key is attached.
+    """
+    validate_download_url(s3_url)
+    client = get_http_client()
+    downloaded = 0
+    async with client.stream("GET", s3_url) as response:
+        response.raise_for_status()
+        with open(dest, "wb") as f:
+            async for chunk in response.aiter_bytes(chunk_size=8192):
+                downloaded += len(chunk)
+                if downloaded > MAX_DOWNLOAD_SIZE:
+                    f.close()
+                    dest.unlink(missing_ok=True)
+                    raise DownloadTooLarge(dest.name)
+                f.write(chunk)
+    return downloaded
 
 
 # =============================================================================
@@ -436,7 +513,7 @@ async def docketbird_get_case_details(case_id: str, page: int = 1, page_size: in
     try:
         api_key = get_user_api_key()
         cprint(f"[MCP] docketbird_get_case_details: {case_id} (page={page})", "green")
-        page_size = min(page_size, 50)
+        page, page_size = _clamp_pagination(page, page_size)
         data = await make_request("/documents", params={"case_id": case_id}, api_key=api_key)
 
         case = data.get("data", {}).get("case", {})
@@ -455,11 +532,7 @@ async def docketbird_get_case_details(case_id: str, page: int = 1, page_size: in
         except Exception as e:
             cprint(f"[MCP] Could not fetch single-case detail for {case_id}: {e}", "yellow")
 
-        total_docs = len(documents)
-        start = (page - 1) * page_size
-        end = start + page_size
-        page_docs = documents[start:end]
-        total_pages = (total_docs + page_size - 1) // page_size if total_docs > 0 else 1
+        page_docs, total_docs, total_pages = _paginate(documents, page, page_size)
 
         lines = [
             f"# Case: {case.get('title', 'N/A')}",
@@ -513,7 +586,7 @@ async def docketbird_search_documents(case_id: str, search_term: str, page: int 
     try:
         api_key = get_user_api_key()
         cprint(f"[MCP] docketbird_search_documents: {case_id} / {search_term} (page={page})", "green")
-        page_size = min(page_size, 50)
+        page, page_size = _clamp_pagination(page, page_size)
         data = await make_request("/documents", params={"case_id": case_id}, api_key=api_key)
 
         documents = data.get("data", {}).get("documents", [])
@@ -528,11 +601,7 @@ async def docketbird_search_documents(case_id: str, search_term: str, page: int 
         if not matches:
             return f"No documents matching '{search_term}' in case {case_id}"
 
-        total = len(matches)
-        start = (page - 1) * page_size
-        end = start + page_size
-        page_matches = matches[start:end]
-        total_pages = (total + page_size - 1) // page_size
+        page_matches, total, total_pages = _paginate(matches, page, page_size)
 
         lines = [f"Found {total} documents matching '{search_term}' (page {page}/{total_pages}):"]
         for doc in page_matches:
@@ -572,7 +641,7 @@ async def docketbird_list_cases(scope: Literal["company", "user"], page: int = 1
     try:
         api_key = get_user_api_key()
         cprint(f"[MCP] docketbird_list_cases: {scope} (page={page})", "green")
-        page_size = min(page_size, 50)
+        page, page_size = _clamp_pagination(page, page_size)
         data = await make_request("/cases", params={"scope": scope}, api_key=api_key)
 
         cases = data.get("data", {}).get("cases", [])
@@ -580,11 +649,7 @@ async def docketbird_list_cases(scope: Literal["company", "user"], page: int = 1
         if not cases:
             return f"No cases found for {scope} scope"
 
-        total = len(cases)
-        start = (page - 1) * page_size
-        end = start + page_size
-        page_cases = cases[start:end]
-        total_pages = (total + page_size - 1) // page_size
+        page_cases, total, total_pages = _paginate(cases, page, page_size)
 
         lines = [f"## {scope.title()} Cases (page {page}/{total_pages}, {total} total)"]
         for case in page_cases:
@@ -606,33 +671,59 @@ async def docketbird_list_cases(scope: Literal["company", "user"], page: int = 1
         return handle_api_error(e, f"list {scope} cases")
 
 
+_reference_cache: dict[str, list[dict[str, Any]]] | None = None
+
+
+def _load_reference_data() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Load and cache the static courts/case-types reference data.
+
+    These JSON files ship with the server and never change at runtime, so we
+    parse them once and reuse the result on subsequent calls.
+    """
+    global _reference_cache
+    if _reference_cache is None:
+        with open(SCRIPT_DIR / "courts.json", "r", encoding="utf-8") as f:
+            courts = json.load(f).get("courts", [])
+        with open(SCRIPT_DIR / "case_types.json", "r", encoding="utf-8") as f:
+            case_types = json.load(f).get("case_types", [])
+        _reference_cache = {"courts": courts, "case_types": case_types}
+    return _reference_cache["courts"], _reference_cache["case_types"]
+
+
 @mcp.tool(annotations=LOCAL_READ_TOOL)
-async def docketbird_list_courts() -> str:
+async def docketbird_list_courts(search: str = "") -> str:
     """Get reference list of available courts and case types.
 
     When to use:
     - User needs court codes for case lookup
     - Understanding case ID format
     - Reference for valid court identifiers
+
+    Args:
+        search: Optional case-insensitive filter applied to the court code and
+                name (e.g. 'california', 'nysd'). Empty returns all courts.
     """
     try:
-        cprint("[MCP] docketbird_list_courts", "green")
+        cprint(f"[MCP] docketbird_list_courts (search={search!r})", "green")
+        courts, case_types = _load_reference_data()
 
-        courts_path = SCRIPT_DIR / "courts.json"
-        case_types_path = SCRIPT_DIR / "case_types.json"
+        term = search.strip().lower()
+        if term:
+            courts = [
+                c for c in courts
+                if term in c.get("value", "").lower()
+                or term in c.get("court_name", "").lower()
+            ]
 
-        with open(courts_path, "r", encoding="utf-8") as f:
-            courts_data = json.load(f)
-
-        with open(case_types_path, "r", encoding="utf-8") as f:
-            case_types_data = json.load(f)
-
-        lines = ["# Court Reference Data", "", "## Courts (first 20)"]
-        for court in courts_data.get("courts", [])[:20]:
+        heading = f"## Courts matching '{search}' ({len(courts)})" if term else f"## Courts ({len(courts)})"
+        lines = ["# Court Reference Data", "", heading]
+        if not courts:
+            lines.append("_No courts matched your search. Try a broader term._")
+        for court in courts:
             lines.append(f"- **{court['value']}**: {court['court_name']}")
 
         lines.extend(["", "## Case Types"])
-        for ct in case_types_data.get("case_types", []):
+        for ct in case_types:
             lines.append(f"- **{ct['abbreviature']}**: {ct['name']} (e.g., {ct['example']})")
 
         return "\n".join(lines)
@@ -676,30 +767,17 @@ async def docketbird_download_document(document_id: str, save_path: str) -> str:
         if not s3_url:
             return f"Document {document_id} exists but is not yet available for download"
 
-        # Validate URL domain (SSRF protection)
-        validate_download_url(s3_url)
-
-        # Streaming download with size limit (S3 URLs are pre-signed, no API key needed)
-        client = get_http_client()
-        cprint(f"[MCP] Downloading from S3: {s3_url[:50]}...", "cyan")
-
         # Prefer the API-provided custom filename; fall back to the S3 URL.
         # Always sanitize (path-safety) regardless of source.
         filename = sanitize_filename(document.get("custom_filename") or s3_url)
         save_dir.mkdir(parents=True, exist_ok=True)
         full_path = save_dir / filename
 
-        async with client.stream("GET", s3_url) as response:
-            response.raise_for_status()
-            downloaded_bytes = 0
-            with open(full_path, "wb") as f:
-                async for chunk in response.aiter_bytes(chunk_size=8192):
-                    downloaded_bytes += len(chunk)
-                    if downloaded_bytes > MAX_DOWNLOAD_SIZE:
-                        f.close()
-                        full_path.unlink(missing_ok=True)
-                        return f"Download aborted: file exceeds {MAX_DOWNLOAD_SIZE // (1024*1024)}MB limit"
-                    f.write(chunk)
+        cprint(f"[MCP] Downloading from S3: {s3_url[:50]}...", "cyan")
+        try:
+            downloaded_bytes = await _stream_to_file(s3_url, full_path)
+        except DownloadTooLarge:
+            return f"Download aborted: file exceeds {MAX_DOWNLOAD_SIZE // (1024 * 1024)}MB limit"
 
         cprint(f"[MCP] Downloaded: {full_path} ({downloaded_bytes} bytes)", "green")
         return f"Downloaded: {document.get('title')} -> {full_path}"
@@ -740,7 +818,6 @@ async def docketbird_download_files(case_id: str, save_path: str) -> str:
 
         save_dir.mkdir(parents=True, exist_ok=True)
 
-        client = get_http_client()
         for doc in documents:
             # Restricted filings are sealed/access-limited; skip defensively
             # (the /documents list may or may not carry this flag).
@@ -753,33 +830,16 @@ async def docketbird_download_files(case_id: str, save_path: str) -> str:
                 skipped.append(doc.get("id"))
                 continue
 
+            # Prefer API-provided custom filename when present; always sanitize.
+            filename = sanitize_filename(doc.get("custom_filename") or s3_url)
+            full_path = save_dir / filename
             try:
-                # Validate URL domain (SSRF protection)
-                validate_download_url(s3_url)
-
                 cprint(f"[MCP] Downloading: {doc.get('title', 'N/A')[:40]}...", "cyan")
-                # Prefer API-provided custom filename when present; always sanitize.
-                filename = sanitize_filename(doc.get("custom_filename") or s3_url)
-                full_path = save_dir / filename
-
-                async with client.stream("GET", s3_url) as response:
-                    response.raise_for_status()
-                    downloaded_bytes = 0
-                    with open(full_path, "wb") as f:
-                        async for chunk in response.aiter_bytes(chunk_size=8192):
-                            downloaded_bytes += len(chunk)
-                            if downloaded_bytes > MAX_DOWNLOAD_SIZE:
-                                f.close()
-                                full_path.unlink(missing_ok=True)
-                                cprint(f"[MCP] Skipped {doc.get('id')}: exceeds size limit", "yellow")
-                                failed.append(f"{doc.get('id')} (too large)")
-                                break
-                        else:
-                            downloaded.append(filename)
-                            continue
-                    # break from inner loop means size exceeded, continue outer loop
-                    continue
-
+                await _stream_to_file(s3_url, full_path)
+                downloaded.append(filename)
+            except DownloadTooLarge:
+                cprint(f"[MCP] Skipped {doc.get('id')}: exceeds size limit", "yellow")
+                failed.append(f"{doc.get('id')} (too large)")
             except ValueError as ve:
                 cprint(f"[MCP] Blocked download {doc.get('id')}: {ve}", "red")
                 failed.append(f"{doc.get('id')} (blocked: {ve})")
@@ -879,6 +939,9 @@ async def docketbird_follow_case(case_id: str) -> str:
 
 mcp_app = mcp.streamable_http_app()
 
+# Background cleanup task handle for HTTP mode (started/stopped via ASGI lifespan).
+_cleanup_task: asyncio.Task | None = None
+
 
 async def app(scope, receive, send):
     """ASGI app: custom routes + rate limiting + MCP/OAuth.
@@ -896,12 +959,19 @@ async def app(scope, receive, send):
         # own lifespan (StreamableHTTP session manager). FastMCP's lifespan only
         # runs via mcp.run(), not streamable_http_app(), so we hook in here.
         async def wrapped_receive():
+            global _cleanup_task
             message = await receive()
             if message["type"] == "lifespan.startup":
                 cprint("[MCP] Lifespan startup: initializing auth database", "yellow")
                 await auth_db.initialize()
+                # Start periodic cleanup here too: FastMCP's lifespan only runs in
+                # stdio mode, so without this, expired tokens/auth codes would
+                # never be purged in HTTP (production) mode.
+                _cleanup_task = asyncio.create_task(_periodic_cleanup())
             elif message["type"] == "lifespan.shutdown":
                 cprint("[MCP] Lifespan shutdown: closing connections", "yellow")
+                if _cleanup_task is not None:
+                    _cleanup_task.cancel()
                 await auth_db.close()
                 await cleanup_http_client()
             return message

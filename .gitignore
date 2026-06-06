@@ -31,10 +31,6 @@ var/
 wheels/
 *.egg-info/
 
-# Environment variables
-.env
-tests/*
-
 # SQLite database
 data/
 *.db
