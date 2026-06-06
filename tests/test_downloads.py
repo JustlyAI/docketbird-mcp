@@ -29,8 +29,9 @@ def _fake_auth(monkeypatch):
 
 
 class _FakeResponse:
-    def __init__(self, chunks):
+    def __init__(self, chunks, headers=None):
         self._chunks = chunks
+        self.headers = headers or {}
 
     def raise_for_status(self):
         return None
@@ -52,11 +53,12 @@ class _FakeStreamCtx:
 
 
 class _FakeClient:
-    def __init__(self, chunks):
+    def __init__(self, chunks, headers=None):
         self._chunks = chunks
+        self._headers = headers
 
     def stream(self, method, url):
-        return _FakeStreamCtx(_FakeResponse(self._chunks))
+        return _FakeStreamCtx(_FakeResponse(self._chunks, self._headers))
 
 
 def _fake_single_document(document):
@@ -89,11 +91,34 @@ async def test_stream_to_memory_returns_bytes(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stream_to_memory_enforces_size_cap(monkeypatch):
-    monkeypatch.setattr(d, "MAX_DOWNLOAD_SIZE", 10)
+async def test_stream_to_memory_enforces_inline_cap(monkeypatch):
+    monkeypatch.setattr(d, "MAX_INLINE_SIZE", 10)
     monkeypatch.setattr(d, "get_http_client", lambda: _FakeClient([b"x" * 8, b"y" * 8]))
     with pytest.raises(d.DownloadTooLarge):
         await d._stream_to_memory("https://docketbird.s3.amazonaws.com/big.pdf")
+
+
+@pytest.mark.asyncio
+async def test_stream_to_memory_early_exits_on_content_length(monkeypatch):
+    """A Content-Length over the cap aborts before the body is read."""
+    monkeypatch.setattr(d, "MAX_INLINE_SIZE", 10)
+    # If the body were read, these chunks are well under the cap; the header alone
+    # must trigger the abort, so we know the early exit (not the running total) fired.
+    client = _FakeClient([b"tiny"], headers={"content-length": "999"})
+    monkeypatch.setattr(d, "get_http_client", lambda: client)
+    with pytest.raises(d.DownloadTooLarge):
+        await d._stream_to_memory("https://docketbird.s3.amazonaws.com/big.pdf")
+
+
+@pytest.mark.asyncio
+async def test_stream_to_file_uses_disk_cap_above_inline_cap(monkeypatch, tmp_path):
+    """A file between the inline and disk caps still streams to disk fine."""
+    monkeypatch.setattr(d, "MAX_INLINE_SIZE", 4)
+    monkeypatch.setattr(d, "MAX_DOWNLOAD_SIZE", 100)
+    monkeypatch.setattr(d, "get_http_client", lambda: _FakeClient([b"x" * 8]))
+    dest = tmp_path / "mid.pdf"
+    n = await d._stream_to_file("https://docketbird.s3.amazonaws.com/mid.pdf", dest)
+    assert n == 8 and dest.read_bytes() == b"x" * 8
 
 
 @pytest.mark.asyncio
@@ -162,7 +187,7 @@ async def test_download_document_remote_bad_save_path_still_returns_content(monk
 @pytest.mark.asyncio
 async def test_download_document_remote_oversize_returns_url(monkeypatch):
     monkeypatch.setattr(d, "_is_remote_session", lambda: True)
-    monkeypatch.setattr(d, "MAX_DOWNLOAD_SIZE", 4)
+    monkeypatch.setattr(d, "MAX_INLINE_SIZE", 4)
     monkeypatch.setattr(
         d, "make_request",
         _fake_single_document({"title": "Big", "docketbird_document_url": S3}),
@@ -173,6 +198,7 @@ async def test_download_document_remote_oversize_returns_url(monkeypatch):
 
     assert isinstance(out, str)
     assert S3 in out  # fall back to the direct link rather than inlining
+    assert "inline limit" in out
 
 
 @pytest.mark.asyncio

@@ -94,16 +94,20 @@ Expiring rows are removed lazily on read and proactively by the hourly
 ## HTTP client & downloads
 
 A single pooled `httpx.AsyncClient` (`get_http_client`) is reused for all
-DocketBird API calls and S3 downloads. Two sibling streamers fetch documents in
-8 KB chunks, both validating the URL against the SSRF allowlist
-(`*.s3.amazonaws.com`, `api.docketbird.com`), requiring HTTPS, and enforcing the
-hard `MAX_DOWNLOAD_SIZE` (50 MB) cap:
+DocketBird API calls and S3 downloads. A shared `_iter_capped_chunks(s3_url,
+max_bytes)` generator is the one place the download invariants live: it validates
+the URL against the SSRF allowlist (`*.s3.amazonaws.com`, `api.docketbird.com`),
+requires HTTPS, bails early if S3's advertised `Content-Length` already exceeds
+the cap, and raises `DownloadTooLarge` the moment the running total would. Two
+sibling streamers consume it with **different caps**:
 
-- `_stream_to_file` writes to disk, deleting any partial file and raising
-  `DownloadTooLarge` if the cap is exceeded, and sanitizes the destination
-  filename (no traversal, no hidden files).
-- `_stream_to_memory` accumulates the bytes in memory (capped the same way) so
-  the content can be returned to the client.
+- `_stream_to_file` writes to disk under `MAX_DOWNLOAD_SIZE` (50 MB), deleting any
+  partial file on overflow, and sanitizes the destination filename (no traversal,
+  no hidden files). Used for local stdio saves.
+- `_stream_to_memory` accumulates the bytes in memory under the smaller
+  `MAX_INLINE_SIZE` (10 MB) so the content can be base64-encoded into the client
+  response. The lower cap reflects base64 inflation (~33%) and the memory/transport
+  cost of inlining; documents above it are returned as a download URL instead.
 
 ### Where downloads go (remote vs local)
 

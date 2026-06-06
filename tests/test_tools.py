@@ -101,8 +101,9 @@ async def test_list_courts_search_no_match():
 
 
 class _FakeResponse:
-    def __init__(self, chunks):
+    def __init__(self, chunks, headers=None):
         self._chunks = chunks
+        self.headers = headers or {}
 
     def raise_for_status(self):
         return None
@@ -124,11 +125,12 @@ class _FakeStreamCtx:
 
 
 class _FakeClient:
-    def __init__(self, chunks):
+    def __init__(self, chunks, headers=None):
         self._chunks = chunks
+        self._headers = headers
 
     def stream(self, method, url):
-        return _FakeStreamCtx(_FakeResponse(self._chunks))
+        return _FakeStreamCtx(_FakeResponse(self._chunks, self._headers))
 
 
 @pytest.mark.asyncio

@@ -126,7 +126,8 @@ In stdio mode, the `DOCKETBIRD_API_KEY` env var is used directly (no OAuth).
 > **How downloads reach you:** the download tools adapt to the transport.
 > - **Remote (HTTP) connection:** `docketbird_download_document` returns the
 >   document's content to your client as an embedded resource (base64, capped at
->   50 MB — larger files come back as a direct download link instead).
+>   10 MB — larger files come back as a direct download link instead, since
+>   base64 inflates the payload and a whole case of inlined PDFs would be huge).
 >   `docketbird_download_files` returns a list of per-document pre-signed download
 >   links rather than inlining a whole case. Any `save_path` is ignored remotely,
 >   since it would write to the server's container, not your computer.

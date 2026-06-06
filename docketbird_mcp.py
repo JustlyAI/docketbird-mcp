@@ -70,8 +70,14 @@ ALLOWED_DOWNLOAD_DOMAINS = {
     "api.docketbird.com",
 }
 
-# Max file size for downloads (50 MB)
+# Max file size for downloads to the server's disk (local stdio mode).
 MAX_DOWNLOAD_SIZE = 50 * 1024 * 1024
+
+# Max file size to return inline to a remote client as a base64 blob. Smaller
+# than the disk cap: base64 inflates ~33% and the whole payload sits in memory
+# and the JSON-RPC response, so large filings are returned as a download URL
+# instead of being inlined.
+MAX_INLINE_SIZE = 10 * 1024 * 1024
 
 # Rate limiting
 RATE_LIMIT_REQUESTS = 30
@@ -436,22 +442,33 @@ class DownloadTooLarge(Exception):
     """Raised when a streamed download exceeds MAX_DOWNLOAD_SIZE."""
 
 
-async def _iter_capped_chunks(s3_url: str):
+async def _iter_capped_chunks(s3_url: str, max_bytes: int):
     """Yield a validated S3 download in 8 KB chunks under a hard size cap.
 
     The single place the download invariants live: it validates the URL domain
     (SSRF protection) and requires HTTPS before opening the stream, and raises
-    DownloadTooLarge as soon as the running total would exceed MAX_DOWNLOAD_SIZE.
-    httpx errors propagate. S3 URLs are pre-signed, so no API key is attached.
+    DownloadTooLarge as soon as the running total would exceed max_bytes. When S3
+    declares a Content-Length over the cap, it bails before reading the body so an
+    over-cap file isn't transferred just to be discarded. httpx errors propagate.
+    S3 URLs are pre-signed, so no API key is attached.
     """
     validate_download_url(s3_url)
     client = get_http_client()
     downloaded = 0
     async with client.stream("GET", s3_url) as response:
         response.raise_for_status()
+        # Early exit on the advertised size; the running total below is the
+        # authoritative guard since Content-Length may be absent, wrong, or
+        # malformed (so a non-numeric value is ignored rather than crashing).
+        try:
+            declared = int(response.headers.get("content-length") or 0)
+        except ValueError:
+            declared = 0
+        if declared > max_bytes:
+            raise DownloadTooLarge("document")
         async for chunk in response.aiter_bytes(chunk_size=8192):
             downloaded += len(chunk)
-            if downloaded > MAX_DOWNLOAD_SIZE:
+            if downloaded > max_bytes:
                 raise DownloadTooLarge("document")
             yield chunk
 
@@ -460,14 +477,14 @@ async def _stream_to_file(s3_url: str, dest: Path) -> int:
     """Stream a document from a validated S3 URL to dest with a hard size cap.
 
     Returns the number of bytes written. Deletes any partial file and re-raises
-    if the download exceeds MAX_DOWNLOAD_SIZE.
+    if the download exceeds MAX_DOWNLOAD_SIZE (the disk cap).
     """
     # Validate before creating the file so a rejected domain leaves nothing behind.
     validate_download_url(s3_url)
     downloaded = 0
     try:
         with open(dest, "wb") as f:
-            async for chunk in _iter_capped_chunks(s3_url):
+            async for chunk in _iter_capped_chunks(s3_url, MAX_DOWNLOAD_SIZE):
                 f.write(chunk)
                 downloaded += len(chunk)
     except DownloadTooLarge:
@@ -481,10 +498,11 @@ async def _stream_to_memory(s3_url: str) -> bytes:
 
     The in-memory sibling of _stream_to_file, used to return document content to
     the client (remote HTTP mode) instead of writing to the server's disk. Shares
-    the same SSRF/HTTPS validation and MAX_DOWNLOAD_SIZE cap via _iter_capped_chunks.
+    the SSRF/HTTPS validation via _iter_capped_chunks but applies the smaller
+    MAX_INLINE_SIZE cap, since the bytes are base64-encoded into the response.
     """
     buffer = bytearray()
-    async for chunk in _iter_capped_chunks(s3_url):
+    async for chunk in _iter_capped_chunks(s3_url, MAX_INLINE_SIZE):
         buffer += chunk
     return bytes(buffer)
 
@@ -878,7 +896,7 @@ async def docketbird_download_document(document_id: str, save_path: str | None =
     Returns:
         - Remote, or local with no save_path: a list of content blocks — a text
           summary plus an embedded resource holding the document bytes (base64),
-          capped at MAX_DOWNLOAD_SIZE. If the document exceeds the cap, returns a
+          capped at MAX_INLINE_SIZE. If the document exceeds that cap, returns a
           text message with its direct download URL instead of inlining it.
         - Local stdio with save_path: a text confirmation of the saved file path.
         - On error / unavailable / restricted: a plain text message.
@@ -928,7 +946,7 @@ async def docketbird_download_document(document_id: str, save_path: str | None =
         try:
             content = await _stream_to_memory(s3_url)
         except DownloadTooLarge:
-            limit_mb = MAX_DOWNLOAD_SIZE // (1024 * 1024)
+            limit_mb = MAX_INLINE_SIZE // (1024 * 1024)
             return (
                 f"'{title}' exceeds the {limit_mb}MB inline limit, so it was not "
                 f"returned directly. Download it from this link instead (expires "
