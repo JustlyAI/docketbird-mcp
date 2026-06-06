@@ -1,7 +1,7 @@
 # Bug Report: `GET /documents` returns 504 (gateway timeout) for an accessible case
 
 **To:** DocketBird API Support
-**Date observed:** 2026-06-04
+**Date observed:** 2026-06-04 (re-confirmed still failing 2026-06-06)
 **Severity:** High — the case's document list cannot be retrieved at all
 **API base:** `https://api.docketbird.com`
 
@@ -18,15 +18,18 @@ backend that assembles this case's document list does not complete within the
 gateway's limit.
 
 The failure is fully server-side: it reproduces with a plain `curl` against the
-API, independent of any client. All read parameters we tried (`page`, `page_size`,
-`limit`, `per_page`, `offset`, `sort`, `fields`, date filters) produce the same
-504, so we have no client-side way to reduce the result size and work around it.
+API, independent of any client. We verified the same 504 at two layers with
+identical ~29s timing — a raw `curl`/`httpx` request (no application framework)
+and our own application client — which isolates the fault to the API rather than
+to any client code. All read parameters we tried (`page`, `page_size`, `limit`,
+`per_page`, `offset`, `sort`, `fields`, date filters) produce the same 504, so we
+have no client-side way to reduce the result size and work around it.
 
 ---
 
 ## Affected account / case
 
-- **API key:** redacted (account key ending `...-BEK` — available on request)
+- **API key:** withheld (available privately on request)
 - **Case ID:** `cand-5:2025-cv-07105`
 - **Title:** Apple Inc. v. Shi et al
 - **Court:** `cand`
@@ -42,7 +45,7 @@ This is the only case on the account (confirmed in both `scope=user` and
 ## Reproduction
 
 ```bash
-# Failing call (replace with the account key ending ...-BEK):
+# Failing call (set DOCKETBIRD_API_KEY to the affected account's key):
 curl -s -o /dev/null \
   -w "HTTP %{http_code} | %{time_total}s | %{size_download} bytes\n" \
   --max-time 60 \
@@ -107,6 +110,13 @@ GET /documents?case_id=cand-5:2025-cv-07105&fields=id,title         -> 504 @ 29.
 GET /cases/cand-5:2025-cv-07105/documents (nested)                  -> 400 @ 0.5s
 ```
 
+Per the published API spec (SwaggerHub `DocketBird/DocketBird/0.3`), `GET
+/documents` documents only `case_id` and no pagination parameters — yet its
+**response schema includes a `has_more` boolean**, which implies the result set
+is meant to be paged. We could not find a documented or working parameter to
+fetch subsequent pages, so every request appears to assemble the full set in one
+synchronous call and times out.
+
 ---
 
 ## Impact
@@ -127,10 +137,11 @@ on `GET /documents`:
 1. Can the `/documents` query for `cand-5:2025-cv-07105` be optimized so it
    completes within the gateway timeout? (e.g., this docket may be unusually
    large or hitting a slow code path.)
-2. Does the API support a server-side paginated or streaming way to retrieve a
-   large case's documents that avoids assembling the full set in one synchronous
-   request? If so, please point us at the correct parameters or endpoint — the
-   ones we tried above appear to be ignored.
+2. The `/documents` response schema includes `has_more`, which implies
+   pagination — but the spec documents no pagination parameter and the ones we
+   tried are ignored. What is the correct parameter (or endpoint) to page through
+   a large case's documents so the full set isn't assembled in one synchronous
+   request that exceeds the gateway timeout?
 3. Is this specific to this case, or a known issue with large/recent dockets?
 
 Happy to provide the full API key, additional timing logs, or run further tests
