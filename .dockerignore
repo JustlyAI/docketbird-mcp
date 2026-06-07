@@ -3,6 +3,13 @@
 .gitignore
 .env
 .env.example
+
+# SQLite auth database — never bake user data (emails, password hashes, API
+# keys) into the image. CI builds from a clean checkout, but a local
+# `docker build .` would otherwise copy a developer's data/ into the image.
+data/
+*.db
+
 __pycache__/
 *.py[cod]
 *$py.class
