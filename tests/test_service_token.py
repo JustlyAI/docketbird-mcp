@@ -52,3 +52,17 @@ async def test_provider_verifies_service_token(db):
     provider = DocketBirdAuthProvider(db)
     tok = await provider.load_access_token(TOKEN)
     assert tok is not None and tok.docketbird_api_key == KEY
+
+
+async def test_token_string_rotation_revokes_old(db):
+    await db.ensure_service_token("svc-token-A", KEY)
+    await db.ensure_service_token("svc-token-B", KEY)
+    assert await db.get_access_token("svc-token-A") is None
+    assert await db.get_access_token("svc-token-B") is not None
+    # exactly one token row for the service user
+    cur = await db._db.execute(
+        "SELECT COUNT(*) c FROM access_tokens at "
+        "JOIN users u ON u.id = at.user_id WHERE u.email = ?",
+        (SERVICE_EMAIL,),
+    )
+    assert (await cur.fetchone())["c"] == 1

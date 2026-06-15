@@ -430,6 +430,11 @@ class AuthDB:
         server-to-server clients (AIFintel). Maps `token` -> a service user
         carrying `api_key`. Re-seeding refreshes the key (supports rotation).
 
+        Rotating the SERVICE_TOKEN *string* revokes any prior service tokens:
+        only the current token stays valid for the service identity. Without
+        this, an old non-expiring row (different PK) would survive forever
+        since cleanup_expired skips NULL-expiry rows.
+
         expires_at is NULL: get_access_token treats NULL as non-expiring and
         cleanup_expired only deletes rows WHERE expires_at IS NOT NULL.
         """
@@ -456,6 +461,12 @@ class AuthDB:
             "(token, user_id, client_id, scopes_json, docketbird_api_key, resource, expires_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (token, user_id, "service", json.dumps(["docketbird"]), api_key, f"{SERVER_URL}/mcp", None),
+        )
+        # Revoke any prior service tokens (e.g. after a SERVICE_TOKEN rotation):
+        # only the current token should remain valid for the service identity.
+        await self._db.execute(
+            "DELETE FROM access_tokens WHERE user_id = ? AND token != ?",
+            (user_id, token),
         )
         await self._db.commit()
         cprint(f"[AUTH] Seeded service access token for user_id={user_id}", "green")
