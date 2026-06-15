@@ -425,6 +425,41 @@ class AuthDB:
         await self._db.execute("DELETE FROM access_tokens WHERE token = ?", (token,))
         await self._db.commit()
 
+    async def ensure_service_token(self, token: str, api_key: str) -> None:
+        """Idempotently seed a non-expiring service access token for trusted
+        server-to-server clients (AIFintel). Maps `token` -> a service user
+        carrying `api_key`. Re-seeding refreshes the key (supports rotation).
+
+        expires_at is NULL: get_access_token treats NULL as non-expiring and
+        cleanup_expired only deletes rows WHERE expires_at IS NOT NULL.
+        """
+        service_email = "service@aifintel.internal"
+        now = time.time()
+        # 1. Ensure the service user exists (access_tokens.user_id FK -> users.id,
+        #    foreign_keys=ON). Random unguessable bcrypt hash so the service
+        #    identity can never log in via the password flow.
+        pw_hash = bcrypt.hashpw(os.urandom(32).hex().encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        await self._db.execute(
+            "INSERT OR IGNORE INTO users (email, password_hash, docketbird_api_key, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (service_email, pw_hash, api_key, now),
+        )
+        cursor = await self._db.execute("SELECT id FROM users WHERE email = ?", (service_email,))
+        user_id = (await cursor.fetchone())["id"]
+        # 2. Keep the embedded key current on every boot.
+        await self._db.execute(
+            "UPDATE users SET docketbird_api_key = ? WHERE id = ?", (api_key, user_id)
+        )
+        # 3. Upsert the non-expiring access token.
+        await self._db.execute(
+            "INSERT OR REPLACE INTO access_tokens "
+            "(token, user_id, client_id, scopes_json, docketbird_api_key, resource, expires_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (token, user_id, "service", json.dumps(["docketbird"]), api_key, f"{SERVER_URL}/mcp", None),
+        )
+        await self._db.commit()
+        cprint(f"[AUTH] Seeded service access token for user_id={user_id}", "green")
+
     # ---- Cleanup ----
 
     async def cleanup_expired(self) -> None:
