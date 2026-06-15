@@ -87,6 +87,11 @@ MAX_INLINE_SIZE = 10 * 1024 * 1024
 RATE_LIMIT_REQUESTS = 30
 RATE_LIMIT_WINDOW = 60  # seconds
 
+# Service token for trusted server-to-server clients (e.g. AIFintel). When both
+# are set, a non-expiring access token is seeded at HTTP startup. Empty = disabled.
+SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")
+SERVICE_DOCKETBIRD_API_KEY = os.getenv("SERVICE_DOCKETBIRD_API_KEY", "")
+
 # =============================================================================
 # Auth: Database + OAuth Provider
 # =============================================================================
@@ -1171,6 +1176,9 @@ async def app(scope, receive, send):
             if message["type"] == "lifespan.startup":
                 cprint("[MCP] Lifespan startup: initializing auth database", "yellow")
                 await auth_db.initialize()
+                if SERVICE_TOKEN and SERVICE_DOCKETBIRD_API_KEY:
+                    await auth_db.ensure_service_token(SERVICE_TOKEN, SERVICE_DOCKETBIRD_API_KEY)
+                    cprint("[MCP] Seeded service access token", "green")
                 # Start periodic cleanup here too: FastMCP's lifespan only runs in
                 # stdio mode, so without this, expired tokens/auth codes would
                 # never be purged in HTTP (production) mode.
