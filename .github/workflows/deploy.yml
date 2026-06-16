@@ -45,6 +45,8 @@ jobs:
               --restart=always \
               -e SERVER_URL="https://app.docketbird-mcp.com" \
               -e GIT_SHA="${{ github.sha }}" \
+              -e SERVICE_TOKEN="${{ secrets.SERVICE_TOKEN }}" \
+              -e SERVICE_DOCKETBIRD_API_KEY="${{ secrets.SERVICE_DOCKETBIRD_API_KEY }}" \
               -v docketbird-data:/app/data \
               -p 127.0.0.1:8040:8080 \
               --health-cmd="python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8080/health')\"" \
