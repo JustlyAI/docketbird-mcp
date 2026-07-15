@@ -4,16 +4,27 @@ An MCP server for searching and downloading court documents via the DocketBird A
 
 ## Tools
 
-| Tool                           | Description                                     |
-| ------------------------------ | ----------------------------------------------- |
-| `docketbird_get_case_details`  | Get case info, parties, and paginated documents |
-| `docketbird_search_documents`  | Search documents within a case by keyword       |
-| `docketbird_list_cases`        | List cases for company or user scope            |
-| `docketbird_list_courts`       | Get court codes and case types (optional `search` filter) |
-| `docketbird_download_document` | Retrieve a single document's content (or save it locally in stdio) |
-| `docketbird_download_files`    | List a case's documents with direct download links (or save them locally in stdio) |
-| `docketbird_get_calendar`      | Get calendar entries (deadlines and hearings)   |
-| `docketbird_follow_case`       | Follow a case so DocketBird monitors new filings |
+Research tools work across DocketBird's full index (all courts, all cases);
+account tools act on your firm's own DocketBird data.
+
+| Tool                              | Description                                     |
+| --------------------------------- | ----------------------------------------------- |
+| `docketbird_search_cases`         | Search ALL cases by name or case number (cursor-paginated) |
+| `docketbird_fulltext_search`      | Full-text search of filing bodies across the whole corpus; `my_cases_only` restricts to your firm's cases |
+| `docketbird_get_case`             | One case's metadata + complaint pointer (no docket fetch) |
+| `docketbird_get_case_details`     | Full docket sheet: case info + paginated document list |
+| `docketbird_search_documents`     | Match docket-entry titles/descriptions within one case |
+| `docketbird_get_document`         | One document's metadata and download links (no bytes) |
+| `docketbird_get_document_text`    | Extracted plain text of a filing (pageable via `offset`) |
+| `docketbird_download_document`    | Retrieve a single document's content (or save it locally in stdio) |
+| `docketbird_download_files`       | List a case's documents with direct download links (or save them locally in stdio) |
+| `docketbird_ask_litigation_graph` | Natural-language questions about parties, attorneys, firms, judges (federal civil, ~30% coverage since July 2025) |
+| `docketbird_list_courts`          | Look up courts live from the API (`search`, `court_system`, `court_type`) |
+| `docketbird_list_court_systems`   | List every covered court system                 |
+| `docketbird_list_cases`           | List cases on your account (company or user scope) |
+| `docketbird_get_calendar`         | Calendar entries for a case, or company-wide (`days` window) |
+| `docketbird_create_autocalendar`  | Create an autocalendar for a case (queued; court fees may apply) |
+| `docketbird_follow_case`          | Follow a case so DocketBird monitors new filings |
 
 > **Using these tools from an agent:** a ready-to-install Claude skill lives in
 > [`skills/docketbird-mcp/`](skills/docketbird-mcp/SKILL.md), covering the case-ID
@@ -191,8 +202,8 @@ docker run -d \
 
 ## Reference Data
 
-- `courts.json` - Court codes and names
-- `case_types.json` - Case type abbreviations and examples
+- `case_types.json` - Case type abbreviations and examples (no API endpoint exists for these)
+- `courts.json` - Historical snapshot of court codes, frozen 2026-05-31. **No longer read by any tool** — `docketbird_list_courts` serves the live `GET /courts` endpoint.
 
 ## Acknowledgment
 

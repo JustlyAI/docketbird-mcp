@@ -10,7 +10,7 @@ lifecycle, the database schema, and the security model.
 | -------------------- | -------------------------------------------------------------------------- |
 | `docketbird_mcp.py`  | MCP server, tools, HTTP client, ASGI app, rate limiting, CLI entry point.  |
 | `auth_provider.py`   | OAuth Authorization Server provider, SQLite auth DB, signup/login HTML.     |
-| `courts.json`        | Static reference data: court codes → names (300+ courts).                   |
+| `courts.json`        | Historical snapshot of court codes (frozen 2026-05-31); no longer read by any tool — courts come live from `GET /courts`. |
 | `case_types.json`    | Static reference data: case-type abbreviations and examples.               |
 | `Dockerfile`         | Container image (non-root, HTTP transport, health check).                  |
 | `.github/workflows/` | Build/push image and deploy to DigitalOcean on push to `main`.             |
