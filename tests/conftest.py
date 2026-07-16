@@ -7,7 +7,6 @@ import cleanly when tests run from anywhere.
 import sys
 from pathlib import Path
 
-import pytest
 import pytest_asyncio
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()

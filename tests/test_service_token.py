@@ -1,7 +1,8 @@
 """Tests for AuthDB.ensure_service_token — non-expiring S2S access token seeding."""
 
 import pytest
-from auth_provider import AuthDB, DocketBirdAuthProvider
+
+from auth_provider import AuthDB, DocketBirdAuthProvider, _token_digest
 
 SERVICE_EMAIL = "service@aifintel.internal"
 TOKEN = "svc-test-token-123"
@@ -30,7 +31,9 @@ async def test_idempotent(db):
     await db.ensure_service_token(TOKEN, KEY)
     cur = await db._db.execute("SELECT COUNT(*) c FROM users WHERE email = ?", (SERVICE_EMAIL,))
     assert (await cur.fetchone())["c"] == 1
-    cur = await db._db.execute("SELECT COUNT(*) c FROM access_tokens WHERE token = ?", (TOKEN,))
+    cur = await db._db.execute(
+        "SELECT COUNT(*) c FROM access_tokens WHERE token = ?", (_token_digest(TOKEN),)
+    )
     assert (await cur.fetchone())["c"] == 1
 
 
@@ -52,6 +55,18 @@ async def test_provider_verifies_service_token(db):
     provider = DocketBirdAuthProvider(db)
     tok = await provider.load_access_token(TOKEN)
     assert tok is not None and tok.docketbird_api_key == KEY
+
+
+async def test_service_token_stored_as_digest_not_raw(db):
+    await db.ensure_service_token(TOKEN, KEY)
+    # The presented raw token still authenticates
+    tok = await db.get_access_token(TOKEN)
+    assert tok is not None
+    # But the DB row never contains the raw string
+    cur = await db._db.execute("SELECT token FROM access_tokens")
+    row = await cur.fetchone()
+    assert row["token"] != TOKEN
+    assert row["token"] == _token_digest(TOKEN)
 
 
 async def test_token_string_rotation_revokes_old(db):

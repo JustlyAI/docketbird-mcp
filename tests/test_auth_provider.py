@@ -8,6 +8,8 @@ rotation, cross-client guards, and revocation.
 import time
 
 import pytest
+from mcp.server.auth.provider import AuthorizationParams, TokenError
+from mcp.shared.auth import OAuthClientInformationFull
 
 from auth_provider import (
     ACCESS_TOKEN_EXPIRY,
@@ -16,8 +18,6 @@ from auth_provider import (
     DocketBirdAuthProvider,
     DocketBirdRefreshToken,
 )
-from mcp.server.auth.provider import AuthorizationParams, TokenError
-from mcp.shared.auth import OAuthClientInformationFull
 
 pytestmark = pytest.mark.asyncio
 

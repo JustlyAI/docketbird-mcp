@@ -14,7 +14,6 @@ import pytest
 
 import docketbird_mcp as d
 
-
 # --------------------------------------------------------------------------- #
 # Pagination
 # --------------------------------------------------------------------------- #
@@ -95,6 +94,16 @@ def test_validate_save_path_rejects_traversal():
 def test_validate_save_path_resolves_ok(tmp_path):
     resolved = d.validate_save_path(str(tmp_path))
     assert resolved == tmp_path.resolve()
+
+
+def test_validate_save_path_allows_dotdot_substring_in_name():
+    """'..' inside a path segment (not a traversal segment) is legitimate."""
+    d.validate_save_path("my..docs")  # should not raise
+
+
+def test_validate_save_path_still_rejects_dotdot_segment():
+    with pytest.raises(ValueError):
+        d.validate_save_path("a/../b")
 
 
 # --------------------------------------------------------------------------- #
