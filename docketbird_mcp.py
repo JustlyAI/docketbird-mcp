@@ -12,15 +12,15 @@ In stdio mode, falls back to DOCKETBIRD_API_KEY env var.
 import asyncio
 import base64
 import html
+import json
 import mimetypes
 import os
 import re
-import json
 import sys
 import time
 from contextlib import asynccontextmanager
-from typing import Literal, Any
 from pathlib import Path
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -28,9 +28,19 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.types import BlobResourceContents, EmbeddedResource, TextContent, ToolAnnotations
-from termcolor import cprint as _cprint
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from termcolor import cprint as _cprint
+
+from auth_provider import (
+    AuthDB,
+    DocketBirdAccessToken,
+    DocketBirdAuthProvider,
+    handle_change_api_key,
+    handle_change_password,
+    handle_login,
+    handle_signup,
+)
 
 
 def cprint(*args, **kwargs):
@@ -43,15 +53,6 @@ def cprint(*args, **kwargs):
     kwargs.setdefault("file", sys.stderr)
     _cprint(*args, **kwargs)
 
-from auth_provider import (
-    AuthDB,
-    DocketBirdAccessToken,
-    DocketBirdAuthProvider,
-    handle_change_api_key,
-    handle_change_password,
-    handle_login,
-    handle_signup,
-)
 
 # =============================================================================
 # Configuration
@@ -1143,7 +1144,7 @@ def _load_case_types() -> list[dict[str, Any]]:
     """
     global _case_types_cache
     if _case_types_cache is None:
-        with open(SCRIPT_DIR / "case_types.json", "r", encoding="utf-8") as f:
+        with open(SCRIPT_DIR / "case_types.json", encoding="utf-8") as f:
             _case_types_cache = json.load(f).get("case_types", [])
     return _case_types_cache
 
@@ -1936,6 +1937,7 @@ async def app(scope, receive, send):
 
 if __name__ == "__main__":
     import argparse
+
     import uvicorn
 
     parser = argparse.ArgumentParser(description="DocketBird MCP Server")
