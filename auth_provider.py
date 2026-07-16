@@ -14,6 +14,7 @@ Flow:
 7. All subsequent MCP requests include Bearer token with user's API key
 """
 
+import hashlib
 import json
 import os
 import secrets
@@ -29,7 +30,6 @@ from mcp.server.auth.provider import (
     AccessToken,
     AuthorizationCode,
     AuthorizationParams,
-    OAuthAuthorizationServerProvider,
     RefreshToken,
     TokenError,
 )
@@ -64,6 +64,14 @@ AUTH_CODE_EXPIRY = 600  # 10 minutes
 ACCESS_TOKEN_EXPIRY = 3600  # 1 hour
 REFRESH_TOKEN_EXPIRY = 86400 * 30  # 30 days
 PENDING_AUTH_EXPIRY = 600  # 10 minutes
+STALE_CLIENT_EXPIRY = 86400 * 30  # 30 days
+
+
+def _token_digest(token: str) -> str:
+    """SHA-256 hex digest of a bearer token. Tokens are 256-bit random
+    (secrets.token_urlsafe(32)), so a fast unsalted hash is sufficient —
+    there is nothing to brute-force. The DB stores only digests."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
 # =============================================================================
@@ -247,6 +255,20 @@ class AuthDB:
         cprint(f"[AUTH] Cleared {cursor.rowcount} access tokens for user_id={user_id}", "green")
         return cursor.rowcount
 
+    async def delete_refresh_tokens_for_user(self, user_id: int) -> int:
+        """Delete all refresh tokens for a user, returning the number removed.
+
+        Used after a password change: revoking only access tokens would leave a
+        long-lived refresh token an attacker could use to mint new access tokens,
+        defeating the point of the password rotation.
+        """
+        cursor = await self._db.execute(
+            "DELETE FROM refresh_tokens WHERE user_id = ?", (user_id,)
+        )
+        await self._db.commit()
+        cprint(f"[AUTH] Cleared {cursor.rowcount} refresh tokens for user_id={user_id}", "green")
+        return cursor.rowcount
+
     # ---- OAuth Clients (Dynamic Client Registration) ----
 
     async def save_client(self, client_info: OAuthClientInformationFull) -> None:
@@ -301,7 +323,7 @@ class AuthDB:
              redirect_uri_provided_explicitly, resource, expires_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
-                auth_code.code,
+                _token_digest(auth_code.code),
                 auth_code.user_id,
                 auth_code.client_id,
                 json.dumps(auth_code.scopes),
@@ -317,13 +339,13 @@ class AuthDB:
     async def get_auth_code(self, code: str) -> DocketBirdAuthCode | None:
         cursor = await self._db.execute(
             "SELECT * FROM auth_codes WHERE code = ? AND expires_at > ?",
-            (code, time.time()),
+            (_token_digest(code), time.time()),
         )
         row = await cursor.fetchone()
         if not row:
             return None
         return DocketBirdAuthCode(
-            code=row["code"],
+            code=code,
             user_id=row["user_id"],
             client_id=row["client_id"],
             scopes=json.loads(row["scopes_json"]),
@@ -334,9 +356,10 @@ class AuthDB:
             expires_at=row["expires_at"],
         )
 
-    async def delete_auth_code(self, code: str) -> None:
-        await self._db.execute("DELETE FROM auth_codes WHERE code = ?", (code,))
+    async def delete_auth_code(self, code: str) -> bool:
+        cursor = await self._db.execute("DELETE FROM auth_codes WHERE code = ?", (_token_digest(code),))
         await self._db.commit()
+        return cursor.rowcount > 0
 
     # ---- Access Tokens ----
 
@@ -346,7 +369,7 @@ class AuthDB:
             (token, user_id, client_id, scopes_json, docketbird_api_key, resource, expires_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
-                token.token,
+                _token_digest(token.token),
                 token.user_id,
                 token.client_id,
                 json.dumps(token.scopes),
@@ -358,20 +381,21 @@ class AuthDB:
         await self._db.commit()
 
     async def get_access_token(self, token: str) -> DocketBirdAccessToken | None:
+        digest = _token_digest(token)
         cursor = await self._db.execute(
             "SELECT * FROM access_tokens WHERE token = ?",
-            (token,),
+            (digest,),
         )
         row = await cursor.fetchone()
         if not row:
             return None
         # Check expiry
         if row["expires_at"] and row["expires_at"] < time.time():
-            await self._db.execute("DELETE FROM access_tokens WHERE token = ?", (token,))
+            await self._db.execute("DELETE FROM access_tokens WHERE token = ?", (digest,))
             await self._db.commit()
             return None
         return DocketBirdAccessToken(
-            token=row["token"],
+            token=token,
             user_id=row["user_id"],
             client_id=row["client_id"],
             scopes=json.loads(row["scopes_json"]),
@@ -388,7 +412,7 @@ class AuthDB:
             (token, user_id, client_id, scopes_json, expires_at)
             VALUES (?, ?, ?, ?, ?)""",
             (
-                token.token,
+                _token_digest(token.token),
                 token.user_id,
                 token.client_id,
                 json.dumps(token.scopes),
@@ -398,31 +422,33 @@ class AuthDB:
         await self._db.commit()
 
     async def get_refresh_token(self, token: str) -> DocketBirdRefreshToken | None:
+        digest = _token_digest(token)
         cursor = await self._db.execute(
             "SELECT * FROM refresh_tokens WHERE token = ?",
-            (token,),
+            (digest,),
         )
         row = await cursor.fetchone()
         if not row:
             return None
         if row["expires_at"] and row["expires_at"] < time.time():
-            await self._db.execute("DELETE FROM refresh_tokens WHERE token = ?", (token,))
+            await self._db.execute("DELETE FROM refresh_tokens WHERE token = ?", (digest,))
             await self._db.commit()
             return None
         return DocketBirdRefreshToken(
-            token=row["token"],
+            token=token,
             user_id=row["user_id"],
             client_id=row["client_id"],
             scopes=json.loads(row["scopes_json"]),
             expires_at=row["expires_at"],
         )
 
-    async def delete_refresh_token(self, token: str) -> None:
-        await self._db.execute("DELETE FROM refresh_tokens WHERE token = ?", (token,))
+    async def delete_refresh_token(self, token: str) -> bool:
+        cursor = await self._db.execute("DELETE FROM refresh_tokens WHERE token = ?", (_token_digest(token),))
         await self._db.commit()
+        return cursor.rowcount > 0
 
     async def delete_access_token(self, token: str) -> None:
-        await self._db.execute("DELETE FROM access_tokens WHERE token = ?", (token,))
+        await self._db.execute("DELETE FROM access_tokens WHERE token = ?", (_token_digest(token),))
         await self._db.commit()
 
     async def ensure_service_token(self, token: str, api_key: str) -> None:
@@ -456,17 +482,18 @@ class AuthDB:
             "UPDATE users SET docketbird_api_key = ? WHERE id = ?", (api_key, user_id)
         )
         # 3. Upsert the non-expiring access token.
+        digest = _token_digest(token)
         await self._db.execute(
             "INSERT OR REPLACE INTO access_tokens "
             "(token, user_id, client_id, scopes_json, docketbird_api_key, resource, expires_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (token, user_id, "service", json.dumps(["docketbird"]), api_key, f"{SERVER_URL}/mcp", None),
+            (digest, user_id, "service", json.dumps(["docketbird"]), api_key, f"{SERVER_URL}/mcp", None),
         )
         # Revoke any prior service tokens (e.g. after a SERVICE_TOKEN rotation):
         # only the current token should remain valid for the service identity.
         await self._db.execute(
             "DELETE FROM access_tokens WHERE user_id = ? AND token != ?",
-            (user_id, token),
+            (user_id, digest),
         )
         await self._db.commit()
         cprint(f"[AUTH] Seeded service access token for user_id={user_id}", "green")
@@ -480,6 +507,16 @@ class AuthDB:
         await self._db.execute("DELETE FROM auth_codes WHERE expires_at < ?", (now,))
         await self._db.execute("DELETE FROM access_tokens WHERE expires_at IS NOT NULL AND expires_at < ?", (now,))
         await self._db.execute("DELETE FROM refresh_tokens WHERE expires_at IS NOT NULL AND expires_at < ?", (now,))
+        # Purge stale Dynamic Client Registration rows: unauthenticated /register
+        # inserts a client on every call, so without this oauth_clients grows
+        # unboundedly. A client with a live refresh or access token is never
+        # purged, so no working connection breaks.
+        await self._db.execute(
+            "DELETE FROM oauth_clients WHERE created_at < ? "
+            "AND client_id NOT IN (SELECT client_id FROM refresh_tokens) "
+            "AND client_id NOT IN (SELECT client_id FROM access_tokens)",
+            (now - STALE_CLIENT_EXPIRY,),
+        )
         await self._db.commit()
 
 
@@ -541,6 +578,12 @@ class DocketBirdAuthProvider:
         """
         cprint(f"[AUTH] exchange_authorization_code: user_id={authorization_code.user_id}", "cyan")
 
+        # Consume the auth code FIRST (atomically), before issuing any tokens.
+        # This makes a concurrent replay of the same code fail closed instead
+        # of minting two live token pairs from a single-use code.
+        if not await self.db.delete_auth_code(authorization_code.code):
+            raise TokenError(error="invalid_grant", error_description="Authorization code already used")
+
         # Look up the user to get their API key
         user = await self.db.get_user(authorization_code.user_id)
         if not user:
@@ -570,9 +613,6 @@ class DocketBirdAuthProvider:
             user_id=user["id"],
         )
         await self.db.save_refresh_token(refresh_token)
-
-        # Delete the used auth code (single-use)
-        await self.db.delete_auth_code(authorization_code.code)
 
         cprint(f"[AUTH] Issued tokens for user {user['email']}", "green")
         return OAuthToken(
@@ -610,6 +650,12 @@ class DocketBirdAuthProvider:
         """Rotate refresh token: issue new access + refresh tokens."""
         cprint(f"[AUTH] exchange_refresh_token: user_id={refresh_token.user_id}", "cyan")
 
+        # Consume the refresh token FIRST (atomically), before issuing any new
+        # tokens. This makes a concurrent replay of the same refresh token
+        # fail closed instead of minting two live token pairs.
+        if not await self.db.delete_refresh_token(refresh_token.token):
+            raise TokenError(error="invalid_grant", error_description="Refresh token already used")
+
         user = await self.db.get_user(refresh_token.user_id)
         if not user:
             raise TokenError(error="invalid_grant", error_description="User not found")
@@ -618,6 +664,8 @@ class DocketBirdAuthProvider:
         use_scopes = scopes if scopes else refresh_token.scopes
 
         # New access token
+        # resource is not tracked on refresh tokens, so refreshed access tokens
+        # carry resource=None (asymmetric with the auth-code path by design)
         new_access = DocketBirdAccessToken(
             token=secrets.token_urlsafe(32),
             client_id=client.client_id,
@@ -637,9 +685,6 @@ class DocketBirdAuthProvider:
             user_id=user["id"],
         )
         await self.db.save_refresh_token(new_refresh)
-
-        # Revoke old refresh token
-        await self.db.delete_refresh_token(refresh_token.token)
 
         cprint(f"[AUTH] Rotated tokens for user {user['email']}", "green")
         return OAuthToken(
@@ -865,6 +910,8 @@ async def handle_signup(request: Request, db: AuthDB) -> HTMLResponse | Redirect
     try:
         await db.create_user(email, password, api_key)
         return _signup_response('<div class="success">Account created. You can now connect DocketBird in Claude.</div>')
+    except aiosqlite.IntegrityError:
+        return _signup_response('<div class="error">An account with this email already exists.</div>', 409)
     except Exception as e:
         cprint(f"[AUTH] Signup error: {e}", "red")
         return _signup_response('<div class="error">Something went wrong. Please try again.</div>', 500)
@@ -997,12 +1044,15 @@ async def handle_change_password(request: Request, db: AuthDB) -> HTMLResponse:
             headers=SECURITY_HEADERS,
         )
 
-    # Update password
+    # Update password and revoke existing sessions (a compromised password being
+    # rotated should actually evict an attacker, matching handle_change_api_key)
     try:
         await db.update_password(user["id"], new_password)
+        await db.delete_access_tokens_for_user(user["id"])
+        await db.delete_refresh_tokens_for_user(user["id"])
         cprint(f"[AUTH] Password changed for {email}", "green")
         return HTMLResponse(
-            _change_password_html('<div class="success">Password changed successfully. You can now log in with your new password.</div>'),
+            _change_password_html('<div class="success">Password changed successfully. Please reconnect from Claude.</div>'),
             headers=SECURITY_HEADERS,
         )
     except Exception as e:
