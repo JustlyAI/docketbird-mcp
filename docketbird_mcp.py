@@ -321,10 +321,9 @@ def handle_api_error(error: Exception, operation: str) -> str:
 def validate_save_path(save_path: str) -> Path:
     """Validate a save path to prevent path traversal attacks.
 
-    Rejects any path containing '..' before resolution. (After .resolve() the
-    string can no longer contain '..', so there is nothing further to check.)
-    """
-    if ".." in save_path:
+    Rejects '..' as a path segment before resolution (a '..' inside a
+    name, like 'my..docs', is legitimate)."""
+    if ".." in Path(save_path).parts:
         raise ValueError("Path traversal not allowed: '..' detected in path")
     return Path(save_path).expanduser().resolve()
 
@@ -1397,6 +1396,7 @@ async def docketbird_download_files(case_id: str, save_path: str | None = None) 
         failed = []
 
         save_dir.mkdir(parents=True, exist_ok=True)
+        used_names: set[str] = set()
 
         for doc in documents:
             # Restricted filings are sealed/access-limited; skip defensively
@@ -1412,6 +1412,15 @@ async def docketbird_download_files(case_id: str, save_path: str | None = None) 
 
             # Prefer API-provided custom filename when present; always sanitize.
             filename = sanitize_filename(doc.get("custom_filename") or s3_url)
+            if filename in used_names:
+                stem, dot, ext = filename.rpartition(".")
+                base = stem if dot else filename
+                suffix = ext if dot else ""
+                n = 2
+                while f"{base}-{n}{dot}{suffix}" in used_names:
+                    n += 1
+                filename = f"{base}-{n}{dot}{suffix}"
+            used_names.add(filename)
             full_path = save_dir / filename
             try:
                 cprint(f"[MCP] Downloading: {doc.get('title', 'N/A')[:40]}...", "cyan")
