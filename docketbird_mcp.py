@@ -12,15 +12,15 @@ In stdio mode, falls back to DOCKETBIRD_API_KEY env var.
 import asyncio
 import base64
 import html
+import json
 import mimetypes
 import os
 import re
-import json
 import sys
 import time
 from contextlib import asynccontextmanager
-from typing import Literal, Any
 from pathlib import Path
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -28,9 +28,19 @@ from mcp.server.auth.middleware.auth_context import get_access_token
 from mcp.server.auth.settings import AuthSettings, ClientRegistrationOptions
 from mcp.server.fastmcp import FastMCP
 from mcp.types import BlobResourceContents, EmbeddedResource, TextContent, ToolAnnotations
-from termcolor import cprint as _cprint
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from termcolor import cprint as _cprint
+
+from auth_provider import (
+    AuthDB,
+    DocketBirdAccessToken,
+    DocketBirdAuthProvider,
+    handle_change_api_key,
+    handle_change_password,
+    handle_login,
+    handle_signup,
+)
 
 
 def cprint(*args, **kwargs):
@@ -43,15 +53,6 @@ def cprint(*args, **kwargs):
     kwargs.setdefault("file", sys.stderr)
     _cprint(*args, **kwargs)
 
-from auth_provider import (
-    AuthDB,
-    DocketBirdAccessToken,
-    DocketBirdAuthProvider,
-    handle_change_api_key,
-    handle_change_password,
-    handle_login,
-    handle_signup,
-)
 
 # =============================================================================
 # Configuration
@@ -321,10 +322,9 @@ def handle_api_error(error: Exception, operation: str) -> str:
 def validate_save_path(save_path: str) -> Path:
     """Validate a save path to prevent path traversal attacks.
 
-    Rejects any path containing '..' before resolution. (After .resolve() the
-    string can no longer contain '..', so there is nothing further to check.)
-    """
-    if ".." in save_path:
+    Rejects '..' as a path segment before resolution (a '..' inside a
+    name, like 'my..docs', is legitimate)."""
+    if ".." in Path(save_path).parts:
         raise ValueError("Path traversal not allowed: '..' detected in path")
     return Path(save_path).expanduser().resolve()
 
@@ -1144,7 +1144,7 @@ def _load_case_types() -> list[dict[str, Any]]:
     """
     global _case_types_cache
     if _case_types_cache is None:
-        with open(SCRIPT_DIR / "case_types.json", "r", encoding="utf-8") as f:
+        with open(SCRIPT_DIR / "case_types.json", encoding="utf-8") as f:
             _case_types_cache = json.load(f).get("case_types", [])
     return _case_types_cache
 
@@ -1397,6 +1397,7 @@ async def docketbird_download_files(case_id: str, save_path: str | None = None) 
         failed = []
 
         save_dir.mkdir(parents=True, exist_ok=True)
+        used_names: set[str] = set()
 
         for doc in documents:
             # Restricted filings are sealed/access-limited; skip defensively
@@ -1412,6 +1413,15 @@ async def docketbird_download_files(case_id: str, save_path: str | None = None) 
 
             # Prefer API-provided custom filename when present; always sanitize.
             filename = sanitize_filename(doc.get("custom_filename") or s3_url)
+            if filename in used_names:
+                stem, dot, ext = filename.rpartition(".")
+                base = stem if dot else filename
+                suffix = ext if dot else ""
+                n = 2
+                while f"{base}-{n}{dot}{suffix}" in used_names:
+                    n += 1
+                filename = f"{base}-{n}{dot}{suffix}"
+            used_names.add(filename)
             full_path = save_dir / filename
             try:
                 cprint(f"[MCP] Downloading: {doc.get('title', 'N/A')[:40]}...", "cyan")
@@ -1927,6 +1937,7 @@ async def app(scope, receive, send):
 
 if __name__ == "__main__":
     import argparse
+
     import uvicorn
 
     parser = argparse.ArgumentParser(description="DocketBird MCP Server")

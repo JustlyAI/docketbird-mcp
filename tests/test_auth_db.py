@@ -8,15 +8,16 @@ and the cleanup sweep. Uses an isolated temp DB per test (auth_db fixture).
 import time
 
 import pytest
+from mcp.server.auth.provider import AuthorizationParams
+from mcp.shared.auth import OAuthClientInformationFull
 
 from auth_provider import (
     AUTH_CODE_EXPIRY,
     DocketBirdAccessToken,
     DocketBirdAuthCode,
     DocketBirdRefreshToken,
+    _token_digest,
 )
-from mcp.server.auth.provider import AuthorizationParams
-from mcp.shared.auth import OAuthClientInformationFull
 
 pytestmark = pytest.mark.asyncio
 
@@ -204,7 +205,9 @@ async def test_expired_access_token_purged_on_read(auth_db):
     await auth_db.save_access_token(_access_token(expires_at=time.time() - 1))
     assert await auth_db.get_access_token("acc-1") is None
     # Confirm it was actually deleted, not just filtered
-    cursor = await auth_db._db.execute("SELECT 1 FROM access_tokens WHERE token = ?", ("acc-1",))
+    cursor = await auth_db._db.execute(
+        "SELECT 1 FROM access_tokens WHERE token = ?", (_token_digest("acc-1"),)
+    )
     assert await cursor.fetchone() is None
 
 
@@ -258,5 +261,138 @@ async def test_cleanup_expired_removes_only_stale(auth_db):
 
     assert await auth_db.get_auth_code("fresh") is not None
     # get_auth_code already filters by expiry, so query the row directly
-    cursor = await auth_db._db.execute("SELECT 1 FROM auth_codes WHERE code = ?", ("stale",))
+    cursor = await auth_db._db.execute(
+        "SELECT 1 FROM auth_codes WHERE code = ?", (_token_digest("stale"),)
+    )
     assert await cursor.fetchone() is None
+
+
+# ---------------------------------------------------------------------------
+# Token digest at rest
+# ---------------------------------------------------------------------------
+
+
+async def test_access_token_stored_as_digest_not_raw(auth_db):
+    await auth_db.create_user("a@example.com", "password123", "k")
+    await auth_db.save_access_token(_access_token(token="raw-access-secret"))
+
+    loaded = await auth_db.get_access_token("raw-access-secret")
+    assert loaded is not None
+    assert loaded.token == "raw-access-secret"
+
+    cursor = await auth_db._db.execute("SELECT token FROM access_tokens")
+    row = await cursor.fetchone()
+    assert row["token"] != "raw-access-secret"
+    assert row["token"] == _token_digest("raw-access-secret")
+
+
+async def test_refresh_token_stored_as_digest_not_raw(auth_db):
+    await auth_db.create_user("a@example.com", "password123", "k")
+    rt = DocketBirdRefreshToken(
+        token="raw-refresh-secret",
+        client_id="client-abc",
+        scopes=["docketbird"],
+        expires_at=int(time.time() + 86400),
+        user_id=1,
+    )
+    await auth_db.save_refresh_token(rt)
+
+    loaded = await auth_db.get_refresh_token("raw-refresh-secret")
+    assert loaded is not None
+    assert loaded.token == "raw-refresh-secret"
+
+    cursor = await auth_db._db.execute("SELECT token FROM refresh_tokens")
+    row = await cursor.fetchone()
+    assert row["token"] != "raw-refresh-secret"
+    assert row["token"] == _token_digest("raw-refresh-secret")
+
+
+async def test_auth_code_stored_as_digest_not_raw(auth_db):
+    await auth_db.create_user("a@example.com", "password123", "k")
+    await auth_db.save_auth_code(_auth_code(code="raw-code-secret"))
+
+    loaded = await auth_db.get_auth_code("raw-code-secret")
+    assert loaded is not None
+    assert loaded.code == "raw-code-secret"
+
+    cursor = await auth_db._db.execute("SELECT code FROM auth_codes")
+    row = await cursor.fetchone()
+    assert row["code"] != "raw-code-secret"
+    assert row["code"] == _token_digest("raw-code-secret")
+
+
+# ---------------------------------------------------------------------------
+# Password change revokes sessions
+# ---------------------------------------------------------------------------
+
+
+async def test_delete_refresh_tokens_for_user(auth_db):
+    await auth_db.create_user("a@example.com", "password123", "k")  # user_id=1
+    rt = DocketBirdRefreshToken(
+        token="ref-1",
+        client_id="client-abc",
+        scopes=["docketbird"],
+        expires_at=int(time.time() + 86400),
+        user_id=1,
+    )
+    await auth_db.save_refresh_token(rt)
+
+    removed = await auth_db.delete_refresh_tokens_for_user(1)
+    assert removed == 1
+    assert await auth_db.get_refresh_token("ref-1") is None
+
+
+# ---------------------------------------------------------------------------
+# Stale OAuth client purge
+# ---------------------------------------------------------------------------
+
+
+async def test_cleanup_purges_stale_client_without_tokens(auth_db):
+    from mcp.shared.auth import OAuthClientInformationFull
+
+    old_client = OAuthClientInformationFull(
+        client_id="stale-client",
+        redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+        token_endpoint_auth_method="none",
+    )
+    await auth_db.save_client(old_client)
+    # Backdate created_at past the 30-day threshold
+    await auth_db._db.execute(
+        "UPDATE oauth_clients SET created_at = ? WHERE client_id = ?",
+        (time.time() - (86400 * 31), "stale-client"),
+    )
+    await auth_db._db.commit()
+
+    await auth_db.cleanup_expired()
+
+    assert await auth_db.get_client("stale-client") is None
+
+
+async def test_cleanup_keeps_stale_client_with_live_refresh_token(auth_db):
+    from mcp.shared.auth import OAuthClientInformationFull
+
+    uid = await auth_db.create_user("live@example.com", "password123", "k")
+    live_client = OAuthClientInformationFull(
+        client_id="live-client",
+        redirect_uris=["https://claude.ai/api/mcp/auth_callback"],
+        token_endpoint_auth_method="none",
+    )
+    await auth_db.save_client(live_client)
+    await auth_db._db.execute(
+        "UPDATE oauth_clients SET created_at = ? WHERE client_id = ?",
+        (time.time() - (86400 * 31), "live-client"),
+    )
+    await auth_db._db.commit()
+    await auth_db.save_refresh_token(
+        DocketBirdRefreshToken(
+            token="ref-live",
+            client_id="live-client",
+            scopes=["docketbird"],
+            expires_at=int(time.time() + 86400),
+            user_id=uid,
+        )
+    )
+
+    await auth_db.cleanup_expired()
+
+    assert await auth_db.get_client("live-client") is not None

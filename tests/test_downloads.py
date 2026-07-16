@@ -283,3 +283,24 @@ async def test_download_files_local_saves_to_disk(monkeypatch, tmp_path):
 
     assert "Downloaded**: 1 files" in out
     assert (tmp_path / "a.pdf").read_bytes() == b"bulk"
+
+
+@pytest.mark.asyncio
+async def test_download_files_local_dedupes_colliding_filenames(monkeypatch, tmp_path):
+    """Two documents that sanitize to the same filename must not overwrite
+    each other; the second gets a numeric suffix."""
+    monkeypatch.setattr(d, "_is_remote_session", lambda: False)
+    docs = [
+        {"id": 1, "title": "First", "custom_filename": "order.pdf", "docketbird_document_url": S3},
+        {"id": 2, "title": "Second", "custom_filename": "order.pdf", "docketbird_document_url": S3},
+    ]
+    monkeypatch.setattr(d, "make_request", _fake_case_documents(docs))
+    monkeypatch.setattr(d, "get_http_client", lambda: _FakeClient([b"content"]))
+
+    out = await d.docketbird_download_files("txnd-1:2020-cv-1", save_path=str(tmp_path))
+
+    assert "Downloaded**: 2 files" in out
+    files = sorted(p.name for p in tmp_path.iterdir())
+    assert files == ["order-2.pdf", "order.pdf"]
+    assert (tmp_path / "order.pdf").read_bytes() == b"content"
+    assert (tmp_path / "order-2.pdf").read_bytes() == b"content"
