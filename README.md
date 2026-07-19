@@ -83,7 +83,8 @@ See [`.env.example`](.env.example) for a template.
 
 ## Connecting to the Deployed Server
 
-See [DocketBird_MCP_Installation_Guide.pdf](DocketBird_MCP_Installation_Guide.pdf) for the full walkthrough with screenshots.
+See [docs/CONNECTING.md](docs/CONNECTING.md) for the full walkthrough, or
+[DocketBird_MCP_Installation_Guide.pdf](DocketBird_MCP_Installation_Guide.pdf) for the same guide with screenshots.
 
 ### Quick version
 

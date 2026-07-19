@@ -1,8 +1,0 @@
-{
-  "mcpServers": {
-    "mcp-fortress": {
-      "type": "http",
-      "url": "https://server.smithery.ai/@mcp-fortress/mcp-fortress-server/mcp"
-    }
-  }
-}

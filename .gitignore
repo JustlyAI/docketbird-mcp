@@ -2,9 +2,14 @@
 .env
 .venv/
 venv/
-.claude/settings*
+
+# Local Claude Code tooling (not part of this project)
+.claude/
 CLAUDE.md
 **/CLAUDE.md
+
+# Local staging area for files pending deletion (not shipped)
+for-deletion/
 
 plans/
 
@@ -41,3 +46,5 @@ data/
 *.swp
 *.swo
 .dmux/
+
+for-deletion/
