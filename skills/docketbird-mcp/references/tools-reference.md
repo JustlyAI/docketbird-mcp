@@ -66,6 +66,10 @@ the big picture, see [SKILL.md](../SKILL.md).
 - `query` (required, max 500 chars). Operators: space/`and` (all terms), `or`,
   `-term` (exclude; the word `not` is unsupported), `term*`/`term!` (endings),
   `/n` `/s` `/p` (proximity), `"..."` (phrase). Emails and `§`/`¶` are searchable.
+- `court_id`: comma-separated; each entry a slug (`nysd`), abbreviation
+  (`S.D.N.Y.`), or full court name. Multiple courts are fanned out one request per
+  court and merged — smaller per-court queries are less likely to hit the backend's
+  ~15 s internal limit.
 - `my_cases_only`: `False` (default) = whole corpus (research scope);
   `True` = only cases associated with the firm's account (account scope).
 - `sort`: `relevance` (default) or `recency`.
@@ -73,6 +77,8 @@ the big picture, see [SKILL.md](../SKILL.md).
   up to 3 highlighted snippets, page URL — plus a cursor footer.
 - Searches the **full text of filing bodies** — not docket-entry titles (that's
   `docketbird_search_documents`). Result window: first 10,000 matches.
+- Transient failures (a raw 500 or timeout when a query crosses DocketBird's
+  internal ~15 s limit) are retried once automatically; no action needed.
 
 ## docketbird_get_case
 
