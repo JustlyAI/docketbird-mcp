@@ -187,6 +187,62 @@ async def test_fulltext_search_empty_page_with_cursor_explains(monkeypatch):
     assert "cursor='NEXT'" in out
 
 
+def _http_500():
+    resp = d.httpx.Response(500, request=d.httpx.Request("GET", "https://api.docketbird.com/documents/search"))
+    return d.httpx.HTTPStatusError("boom", request=resp.request, response=resp)
+
+
+@pytest.mark.asyncio
+async def test_fulltext_retries_transient_500_then_succeeds(monkeypatch):
+    monkeypatch.setattr(d, "FULLTEXT_RETRY_BACKOFF", 0)
+    calls = {"n": 0}
+
+    async def fake(endpoint, params=None, api_key=""):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise _http_500()
+        return {"status": "success", "data": {
+            "documents": [{"document_id": "d1", "case_id": "c1", "document_title": "Order"}],
+            "found": 1, "next_cursor": None}}
+
+    monkeypatch.setattr(d, "make_request", fake)
+    out = await d.docketbird_fulltext_search("motion")
+    assert calls["n"] == 2  # one retry
+    assert "Order" in out
+
+
+@pytest.mark.asyncio
+async def test_fulltext_exhausted_retries_returns_friendly_message(monkeypatch):
+    monkeypatch.setattr(d, "FULLTEXT_RETRY_BACKOFF", 0)
+
+    async def fake(endpoint, params=None, api_key=""):
+        raise _http_500()
+
+    monkeypatch.setattr(d, "make_request", fake)
+    out = await d.docketbird_fulltext_search("summary judgment")
+    assert "timed out" in out and "narrow" in out
+
+
+@pytest.mark.asyncio
+async def test_fulltext_fans_out_multiple_courts(monkeypatch):
+    seen = []
+
+    async def fake(endpoint, params=None, api_key=""):
+        cid = params["court_id"]
+        seen.append(cid)
+        return {"status": "success", "data": {
+            "documents": [{"document_id": f"{cid}-1", "case_id": "c",
+                           "document_title": "T", "date_filed": f"2026-07-1{len(seen)}"}],
+            "found": 3, "next_cursor": None}}
+
+    monkeypatch.setattr(d, "make_request", fake)
+    out = await d.docketbird_fulltext_search("pretrial order", court_id="nysd,flsd", sort="recency")
+    assert seen == ["nysd", "flsd"]      # one request per court, not "nysd,flsd" in one call
+    assert "across 2 courts" in out
+    assert "6 documents matched" in out  # found summed across courts
+    assert "nysd-1" in out and "flsd-1" in out
+
+
 # --------------------------------------------------------------------------- #
 # get_document_text: offset paging + upstream truncation + not-found handling
 # --------------------------------------------------------------------------- #
