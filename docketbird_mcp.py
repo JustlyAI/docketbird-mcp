@@ -89,6 +89,13 @@ MAX_INLINE_SIZE = 10 * 1024 * 1024
 RATE_LIMIT_REQUESTS = 30
 RATE_LIMIT_WINDOW = 60  # seconds
 
+# Full-text search resilience. DocketBird's search backend aborts with a
+# transient 500 when a query crosses its internal ~15s limit; the same query
+# usually succeeds on a quick retry, and smaller (single-court) queries are far
+# less likely to hit it. See docketbird_fulltext_search.
+FULLTEXT_RETRY_ATTEMPTS = 2  # total attempts per request (i.e. one retry)
+FULLTEXT_RETRY_BACKOFF = 1.0  # seconds to wait between attempts
+
 # Service token for trusted server-to-server clients (e.g. AIFintel). When both
 # are set, a non-expiring access token is seeded at HTTP startup. Empty = disabled.
 SERVICE_TOKEN = os.getenv("SERVICE_TOKEN", "")
@@ -312,6 +319,37 @@ def handle_api_error(error: Exception, operation: str) -> str:
     if isinstance(error, httpx.ConnectError):
         return f"Connection failed for {operation}. Check internet connection."
     return f"Error for {operation}: {type(error).__name__}: {error}"
+
+
+def _is_retryable_search_error(error: Exception) -> bool:
+    """True for the transient failures DocketBird's search backend throws when a
+    query crosses its internal ~15s limit: a raw 500, or the request timing out.
+    The same query usually succeeds on a quick retry."""
+    if isinstance(error, httpx.HTTPStatusError):
+        return error.response.status_code == 500
+    return isinstance(error, httpx.TimeoutException)
+
+
+async def _fulltext_search_request(params: dict[str, Any], api_key: str) -> dict[str, Any]:
+    """Call /documents/search with bounded retry on transient backend 500s/timeouts.
+
+    Returns the parsed 'data' payload. Non-retryable errors (and the final
+    retryable one) propagate to the caller for normal error handling.
+    """
+    for attempt in range(1, FULLTEXT_RETRY_ATTEMPTS + 1):
+        try:
+            data = await make_request("/documents/search", params=params, api_key=api_key)
+            return data.get("data", {})
+        except Exception as e:
+            if not _is_retryable_search_error(e) or attempt == FULLTEXT_RETRY_ATTEMPTS:
+                raise
+            cprint(
+                f"[MCP] fulltext transient {type(e).__name__} on attempt "
+                f"{attempt}/{FULLTEXT_RETRY_ATTEMPTS}; retrying in {FULLTEXT_RETRY_BACKOFF}s",
+                "yellow",
+            )
+            await asyncio.sleep(FULLTEXT_RETRY_BACKOFF)
+    raise RuntimeError("unreachable")  # pragma: no cover
 
 
 # =============================================================================
@@ -882,25 +920,51 @@ async def docketbird_fulltext_search(
     try:
         api_key = get_user_api_key()
         cprint(f"[MCP] docketbird_fulltext_search: {query!r} (my_cases_only={my_cases_only})", "green")
-        params: dict[str, Any] = {"q": query, "size": _clamp_cursor_size(size), "sort": sort}
-        if court_id:
-            params["court_id"] = court_id
+        size = _clamp_cursor_size(size)
+        base_params: dict[str, Any] = {"q": query, "size": size, "sort": sort}
         if case_id:
-            params["case_id"] = case_id
+            base_params["case_id"] = case_id
         if filed_after:
-            params["filed_after"] = filed_after
+            base_params["filed_after"] = filed_after
         if filed_before:
-            params["filed_before"] = filed_before
+            base_params["filed_before"] = filed_before
         if my_cases_only:
-            params["my_cases_only"] = "true"
+            base_params["my_cases_only"] = "true"
         if cursor:
-            params["cursor"] = cursor
-        data = await make_request("/documents/search", params=params, api_key=api_key)
+            base_params["cursor"] = cursor
 
-        payload = data.get("data", {})
-        documents = payload.get("documents", [])
-        found = payload.get("found", 0)
-        next_cursor = payload.get("next_cursor")
+        courts = [c.strip() for c in court_id.split(",") if c.strip()]
+        # A single /documents/search over several courts is more likely to cross
+        # DocketBird's ~15s backend limit (a transient 500). When we're not
+        # mid-cursor, fan out one court per request and merge — each smaller query
+        # is far likelier to land under the limit. Cursor pagination is per-
+        # request, so we only fan out on the first page.
+        is_fanout = len(courts) > 1 and not cursor
+        if is_fanout:
+            documents: list[dict[str, Any]] = []
+            found = 0
+            more_remain = False
+            for c in courts:
+                payload = await _fulltext_search_request({**base_params, "court_id": c}, api_key)
+                found += payload.get("found", 0)
+                documents.extend(payload.get("documents", []))
+                if payload.get("next_cursor"):
+                    more_remain = True
+            if sort == "recency":
+                documents.sort(key=lambda d: d.get("date_filed") or "", reverse=True)
+            if len(documents) > size:
+                more_remain = True
+                documents = documents[:size]
+            next_cursor = None
+        else:
+            single = {**base_params}
+            if courts:
+                single["court_id"] = courts[0]
+            payload = await _fulltext_search_request(single, api_key)
+            documents = payload.get("documents", [])
+            found = payload.get("found", 0)
+            next_cursor = payload.get("next_cursor")
+            more_remain = bool(next_cursor)
 
         scope_label = "your firm's cases" if my_cases_only else "all courts"
         if case_id:
@@ -909,10 +973,10 @@ async def docketbird_fulltext_search(
             scope_label += f", courts: {court_id}"
         lines = [f"## Full-text search: {query!r} ({scope_label})"]
         if not documents:
-            if next_cursor:
+            if more_remain:
                 lines.append(
                     "\n_This page is empty (restricted documents were removed after "
-                    "matching), but more results remain — follow the cursor below._"
+                    "matching), but more results remain._"
                 )
             else:
                 lines.append("\n_No documents matched._")
@@ -927,12 +991,32 @@ async def docketbird_fulltext_search(
             if doc.get("canonical_url"):
                 lines.append(f"- Page: {doc.get('canonical_url')}")
 
-        lines.extend(_cursor_footer(found, len(documents), next_cursor, "documents"))
+        if is_fanout:
+            lines.append(
+                f"\n_{found} documents matched across {len(courts)} courts; "
+                f"{len(documents)} on this page._"
+            )
+            if more_remain:
+                lines.append(
+                    "_More results remain. Merged multi-court pages can't be cursor-paged; "
+                    "query a single court_id to page deeper._"
+                )
+            else:
+                lines.append("_End of results._")
+        else:
+            lines.extend(_cursor_footer(found, len(documents), next_cursor, "documents"))
         return "\n".join(lines)
 
     except ValueError as e:
         return str(e)
     except Exception as e:
+        if _is_retryable_search_error(e):
+            return (
+                f"DocketBird's full-text search backend timed out on {query!r} "
+                f"(a transient ~15s server limit; retried {FULLTEXT_RETRY_ATTEMPTS}x). "
+                "Try again, or narrow the search with court_id, case_id, or a "
+                "filed_after / filed_before date to shrink the result set."
+            )
         return handle_api_error(e, f"full-text search {query!r}")
 
 
