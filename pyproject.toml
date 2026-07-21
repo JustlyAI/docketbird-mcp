@@ -24,6 +24,12 @@ dev = [
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
+# This is an application built from two root modules, not a package library.
+# Declare them explicitly so setuptools does not attempt flat-layout package
+# auto-discovery, which fails when sibling dirs (skills/, archive/, ...) exist.
+[tool.setuptools]
+py-modules = ["docketbird_mcp", "auth_provider"]
+
 [tool.ruff]
 target-version = "py311"
 line-length = 120
